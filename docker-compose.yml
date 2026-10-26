@@ -18,6 +18,26 @@ services:
       retries: 60
       start_period: 600s
 
+  # Redis Stack (Redis + RediSearch vector search) for the L1 exact cache,
+  # L2 semantic cache and document summaries. Reachable only inside the
+  # Docker network. Unlike the reference (--save ""), RDB snapshots are on
+  # so the redis-data volume actually survives Redis restarts.
+  redis:
+    image: redis/redis-stack-server:7.4.0-v1
+    command: ["redis-stack-server",
+              "--maxmemory", "${REDIS_MAXMEMORY:-512mb}",
+              "--maxmemory-policy", "volatile-lru",
+              "--save", "300 1", "--save", "60 100",
+              "--appendonly", "no",
+              "--dir", "/data"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   go-backend:
     build: ./go-backend
     ports:
@@ -26,10 +46,13 @@ services:
       - .env
     environment:
       - RAG_SERVICE_URL=http://python-rag:8000
+      - REDIS_ADDR=redis:6379
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     depends_on:
       python-rag:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   ui:
@@ -43,6 +66,7 @@ services:
 
 volumes:
   chroma-data:
+  redis-data:
   # Shared with the test image so model weights are downloaded only once.
   hf-models:
     name: councilai-hf

@@ -34,6 +34,8 @@ type Config struct {
 	MockLLM       bool // explicit offline mode; no provider is contacted
 	WebSearch     bool // web grounding for questions without a document (reference default: on)
 
+	Redis RedisConfig
+
 	OpenRouterAPIKey string
 	OpenRouterURL    string
 	GeminiAPIKey     string
@@ -51,6 +53,21 @@ type Config struct {
 	StageTimeout   time.Duration // per model call inside a council stage
 	LLMTimeout     time.Duration // HTTP client timeout for council members
 	RequestTimeout time.Duration // whole query
+}
+
+// RedisConfig configures the Redis Stack caches (reference redis section).
+type RedisConfig struct {
+	Enabled           bool // false: no caching at all (there is no in-process fallback)
+	Addr              string
+	Password          string
+	DB                int
+	OpTimeout         time.Duration // per Redis round trip
+	ExactTTL          time.Duration // L1 and document summaries (reference: 1h)
+	SemanticTTL       time.Duration // L2 (reference: 24h)
+	SemanticThreshold float64       // cosine similarity (reference: 0.85)
+	FailureThreshold  int           // breaker: consecutive failures to open (reference: 3)
+	SuccessThreshold  int           // breaker: half-open successes to close (reference: 2)
+	BreakerTimeout    time.Duration // breaker cooldown (reference: 10s)
 }
 
 // Keys returns the provider credentials.
@@ -72,8 +89,21 @@ type yamlSlot struct {
 // is deliberately no "keys" section: credentials belong in the environment.
 type yamlSchema struct {
 	Server struct {
-		Port string `yaml:"port"`
+		Port                   string   `yaml:"port"`
+		SemanticCacheThreshold *float64 `yaml:"semantic_cache_threshold"`
 	} `yaml:"server"`
+	Redis struct {
+		Enabled          *bool  `yaml:"enabled"`
+		Addr             string `yaml:"addr"`
+		Password         string `yaml:"password"`
+		DB               int    `yaml:"db"`
+		OpTimeout        string `yaml:"op_timeout"`
+		ExactTTL         string `yaml:"exact_ttl"`
+		SemanticTTL      string `yaml:"semantic_ttl"`
+		FailureThreshold int    `yaml:"circuit_breaker_failure_threshold"`
+		SuccessThreshold int    `yaml:"circuit_breaker_success_threshold"`
+		Timeout          string `yaml:"circuit_breaker_timeout"`
+	} `yaml:"redis"`
 	RAG struct {
 		ServiceURL string `yaml:"service_url"`
 		WebSearch  *bool  `yaml:"web_search"`
@@ -193,6 +223,46 @@ func LoadFrom(path string, getenv func(string) string) (*Config, error) {
 	cfg.StageTimeout = l.duration("STAGE_TIMEOUT", y.Council.Timeouts.Stage, 30*time.Second)
 	cfg.LLMTimeout = l.duration("LLM_TIMEOUT", y.Council.Timeouts.LLM, 120*time.Second)
 	cfg.RequestTimeout = l.duration("REQUEST_TIMEOUT", y.Council.Timeouts.Request, 120*time.Second)
+
+	redisDefault := true
+	if y.Redis.Enabled != nil {
+		redisDefault = *y.Redis.Enabled
+	}
+	r := &cfg.Redis
+	r.Enabled = l.boolean("REDIS_ENABLED", redisDefault)
+	r.Addr = l.str("REDIS_ADDR", y.Redis.Addr, "redis:6379")
+	r.Password = getenv("REDIS_PASSWORD")
+	if r.Password == "" {
+		r.Password = y.Redis.Password
+	}
+	r.DB = l.integer("REDIS_DB", y.Redis.DB, 0)
+	if r.DB != 0 {
+		l.fail("REDIS_DB must be 0: RediSearch indexes only work in database 0")
+	}
+	r.OpTimeout = l.duration("REDIS_OP_TIMEOUT", y.Redis.OpTimeout, 500*time.Millisecond)
+	r.ExactTTL = l.duration("REDIS_EXACT_TTL", y.Redis.ExactTTL, time.Hour)
+	r.SemanticTTL = l.duration("REDIS_SEMANTIC_TTL", y.Redis.SemanticTTL, 24*time.Hour)
+	r.FailureThreshold = l.integer("CIRCUIT_BREAKER_FAILURE_THRESHOLD", y.Redis.FailureThreshold, 3)
+	r.SuccessThreshold = l.integer("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", y.Redis.SuccessThreshold, 2)
+	r.BreakerTimeout = l.duration("CIRCUIT_BREAKER_TIMEOUT", y.Redis.Timeout, 10*time.Second)
+	thr := 0.85
+	if y.Server.SemanticCacheThreshold != nil {
+		thr = *y.Server.SemanticCacheThreshold
+	}
+	if v := strings.TrimSpace(getenv("SEMANTIC_CACHE_THRESHOLD")); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			l.fail("SEMANTIC_CACHE_THRESHOLD must be a number, got %q", v)
+		}
+		thr = f
+	}
+	if thr <= 0 || thr > 1 {
+		l.fail("semantic cache threshold must be in (0, 1], got %v", thr)
+	}
+	r.SemanticThreshold = thr
+	if r.FailureThreshold < 1 || r.SuccessThreshold < 1 {
+		l.fail("circuit breaker thresholds must be at least 1")
+	}
 
 	for old, replacement := range legacyEnv {
 		if getenv(old) != "" {

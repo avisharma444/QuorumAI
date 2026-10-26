@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/councilai-starter/internal/cache/cachetest"
 	"example.com/councilai-starter/internal/council"
 	"example.com/councilai-starter/internal/llm/llmtest"
 )
@@ -27,6 +28,7 @@ var errProvider = errors.New("provider down")
 func newTestServer(c *council.Council, ragURL string) *Server {
 	s := NewServer(c, ragURL)
 	s.WebSearch = false
+	s.Cache = cachetest.NewExact()
 	return s
 }
 

@@ -11,14 +11,13 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 - **Response streaming:** SSE events (`start`, `retrieved`, `candidate`, `review`, `final`; plus errors/fallbacks).
 - **Python FastAPI RAG service (reference architecture):** document inspection → adaptive extraction (PyPDF2 text layer, pdfplumber layout/tables, Tesseract OCR for images and scanned PDFs) → layout-aware chunks (tables kept whole, headings attached, captions grouped) → `BAAI/bge-small-en-v1.5` embeddings (mean pooling, 384-D, CPU) → persistent **ChromaDB** collection per document → `cross-encoder/ms-marco-MiniLM-L-6-v2` reranking of 3×k vector candidates. Endpoints: `/ingest`, `/retrieve`, `/retrieve-all`, `/embed`, `/search`, `/health` (liveness), `/ready` (models loaded).
 - **Persistence:** Chroma data in the `chroma-data` volume; model weights in the `councilai-hf` volume (downloaded once). Re-uploading identical bytes replaces that document atomically.
-- **Exact-query cache:** thread-safe Go in-process TTL cache (one-hour TTL) for repeated questions.
+- **Redis Stack caching (reference architecture):** L1 exact cache (JSON in Redis, 1 h TTL, hashed versioned keys), L2 semantic cache (RediSearch FLAT/COSINE/FLOAT32 384-D index `idx:semantic_cache`, KNN `FT.SEARCH`, 24 h TTL, threshold 0.85) and document summaries (`councilai:v3:doc_summary:<id>`), all behind one circuit breaker (3 failures → open, 10 s cooldown, 1 half-open probe, 2 successes → closed). Redis is an optimisation: when it is down, requests are answered normally and nothing is cached in-process.
 - **Streamlit UI:** document upload, model stages, candidate/review inspection.
 - **Safe default testing:** `MOCK_LLM=true` runs without model API keys, using clearly identified mock answers.
 - **Tests:** Go unit tests (including parallel execution and SSE), Python ingestion/retrieval tests, an HTTP latency benchmark, and a real two-service smoke-test script.
 
 ### Deliberately NOT implemented yet
 
-- Redis Stack L1+L2 semantic cache and circuit breaker
 - JWT authentication and PostgreSQL user storage
 - Prometheus/Grafana/OpenTelemetry instrumentation (the current `/metrics` is a JSON counter endpoint)
 - Calibrated confidence scores, quality improvement claims, performance claims, or load-test evidence
@@ -143,11 +142,52 @@ Check provider pricing first. A complete council request makes 7+ model calls
 (3 candidates + 3 peer reviews + chairman; more in deep mode). Responses
 include provider-reported token usage per call and in total (`token_usage`).
 
+### Caching: what is cached, and the semantic threshold
+
+- **Lookup order:** L1 exact key → LLM router → L2 semantic lookup (only when
+  the plan uses the attached document) → retrieval and council. L1 keys cover
+  tenant ("public" until auth exists), document, normalised question, auto vs
+  override strategy, top_k, model/prompt fingerprint. L2 scope adds the
+  resolved strategy and the embedding model, so paraphrases never reuse an
+  answer produced under a different strategy, document or configuration.
+- **Only complete answers are cached:** no router fallbacks, grounding
+  failures, chairman/reflection/revision failures, single-model or
+  no-review fallbacks, or cancelled requests. Web-grounded answers are never
+  semantically cached.
+- **Responses are truthful about cache hits:** `cache.tier`,
+  `cache.inference_executed`, similarity/distance for L2, and the original
+  generation's tokens in `cache.original_token_usage` (not counted again).
+- **Measured threshold trade-off** (`benchmarks/cache_benchmark.py`: 25
+  paraphrase pairs, 25 near-miss pairs, real BGE vectors; end-to-end through
+  Redis matched these rates exactly):
+
+  | similarity threshold | paraphrases reused | near-misses wrongly reused (with number guard) |
+  |---|---|---|
+  | 0.80 | 92% | 68% |
+  | **0.85 (default)** | **52%** | **28%** |
+  | 0.90 | 16% | 16% |
+  | 0.95 | 4% | 0% |
+
+  Pairs such as "features added / removed in version 3", "minimum / maximum
+  age" and "enable / disable 2FA" score ≈0.93, above most real paraphrases,
+  so no threshold separates them with these embeddings. A hit is also
+  rejected when the two questions mention different numbers (2024 vs 2025).
+  Treat the semantic cache as unsafe for high-stakes use at 0.85; raise
+  `SEMANTIC_CACHE_THRESHOLD` (0.95 here gave no false positives but little
+  reuse) or disable Redis.
+
 ### Tests and benchmarks
 
 ```bash
-# Go tests, including race detector
+# Go tests, including race detector (integration tests need Redis Stack; see below)
 (cd go-backend && go test -race ./...)
+# Go tests against real Redis Stack + real BGE embeddings (stack running)
+docker run --rm --network councilai-reproduced_default -v "$PWD/go-backend":/src -w /src \
+  -e REDIS_TEST_ADDR=redis:6379 -e RAG_TEST_URL=http://python-rag:8000 golang:1.23 go test -race ./...
+# Cache benchmarks: Redis-only latency (Go) and end-to-end / false-positive evaluation (Python)
+docker run --rm --network councilai-reproduced_default -v "$PWD/go-backend":/src -w /src \
+  -e CACHE_BENCH=1 -e REDIS_TEST_ADDR=redis:6379 golang:1.23 go test -run TestCacheLatencyReport -v ./internal/cache/
+docker run --rm --network councilai-reproduced_default -v "$PWD/benchmarks:/b" councilai-rag-test python /b/cache_benchmark.py
 # Python tests, including real OCR and real-model integration tests (Docker, no local installs)
 (cd python-rag && docker build --target test -t councilai-rag-test . && docker run --rm -v councilai-hf:/models councilai-rag-test)
 # Retrieval evaluation (40-chunk fictional corpus, 30 queries): hash baseline vs neural vs neural + rerank

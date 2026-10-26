@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"example.com/councilai-starter/internal/agent"
+	"example.com/councilai-starter/internal/cache/cachetest"
 	"example.com/councilai-starter/internal/council"
 	"example.com/councilai-starter/internal/llm"
 	"example.com/councilai-starter/internal/llm/llmtest"
@@ -29,6 +30,8 @@ type fakeRAG struct {
 	retrieveStatus int
 	searchStatus   int
 	searchBody     string
+	// embed maps a question to (vector, model); nil means a fixed vector.
+	embed func(text string) ([]float32, string)
 }
 
 const okSearch = `{"status":"ok","results":["Source [1]: Mirevale\nURL: https://example.org/m\nContent: Mirevale is the capital.\n"],"sources":[{"rank":1,"title":"Mirevale","url":"https://example.org/m","content_source":"page"}],"error":null}`
@@ -54,6 +57,17 @@ func newFakeRAG(t *testing.T) *fakeRAG {
 		case "/search":
 			w.WriteHeader(f.searchStatus)
 			fmt.Fprint(w, f.searchBody)
+		case "/embed":
+			var req struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			vec, model := unitVector(0), "BAAI/bge-small-en-v1.5"
+			if f.embed != nil {
+				vec, model = f.embed(req.Text)
+			}
+			out, _ := json.Marshal(map[string]any{"embedding": vec, "model": model, "dimension": len(vec)})
+			_, _ = w.Write(out)
 		default:
 			w.WriteHeader(404)
 		}
@@ -83,6 +97,7 @@ func newEnv(t *testing.T, replies map[string]llmtest.Reply) *env {
 	rag := newFakeRAG(t)
 	f := llmtest.New(replies)
 	srv := NewServer(council.New(f.Clients("a", "b", "c"), f.Client("chair"), 2*time.Second), rag.URL)
+	srv.Cache = cachetest.NewExact()
 	srv.Router = agent.NewRouter(f.Client("router"))
 	srv.IngestAgent = agent.NewIngestAgent(f.Client("ingest"))
 	return &env{srv, rag, f}
@@ -129,7 +144,7 @@ func TestIngestGeneratesAndStoresSummary(t *testing.T) {
 	if got := e.llm.Prompt("summarize", "ingest"); got != "Document Sample:\nZogland facts. The capital of Zogland is Mirevale." {
 		t.Fatalf("summarizer got %q", got)
 	}
-	if s, ok := e.srv.Summaries.Get("doc-1"); !ok || s != "A summary about Zogland and its capital." {
+	if s, ok := e.srv.getSummary(context.Background(), "doc-1"); !ok || s != "A summary about Zogland and its capital." {
 		t.Fatal("summary not stored under the doc_id")
 	}
 	// Queries reuse the stored summary; no second summarization.
@@ -146,7 +161,7 @@ func TestDuplicateIngestionKeepsSummariesSeparate(t *testing.T) {
 		t.Fatalf("docs %v %v", first["doc_id"], second["doc_id"])
 	}
 	for _, id := range []string{"doc-1", "doc-2"} {
-		if s, ok := e.srv.Summaries.Get(id); !ok || !strings.HasPrefix(s, "[MOCK summary]") {
+		if s, ok := e.srv.getSummary(context.Background(), id); !ok || !strings.HasPrefix(s, "[MOCK summary]") {
 			t.Fatalf("%s: %q", id, s)
 		}
 	}
@@ -158,7 +173,7 @@ func TestIngestSummaryFailuresDoNotFailIngestion(t *testing.T) {
 	if out["summary_status"] != "failed" || !strings.Contains(out["summary_error"].(string), "503") || out["summary"] != nil {
 		t.Fatalf("%v", out)
 	}
-	if _, ok := e.srv.Summaries.Get("doc-1"); ok {
+	if _, ok := e.srv.getSummary(context.Background(), "doc-1"); ok {
 		t.Fatal("no summary may be stored after a failure")
 	}
 
@@ -183,7 +198,7 @@ func TestSummarizationCancelled(t *testing.T) {
 	if status != "cancelled" || summary != "" {
 		t.Fatalf("%s %q", status, summary)
 	}
-	if _, ok := e.srv.Summaries.Get("doc-x"); ok {
+	if _, ok := e.srv.getSummary(context.Background(), "doc-x"); ok {
 		t.Fatal("cancelled summary stored")
 	}
 }
@@ -335,9 +350,9 @@ func TestCacheIdentitiesAreSeparated(t *testing.T) {
 	}
 	// A different model configuration never reuses an entry.
 	q1 := council.QueryRequest{Question: "x"}
-	k1 := e.srv.cacheKey(q1, ModeAuto, "")
+	k1 := e.srv.l1Key(q1, ModeAuto, "")
 	e.srv.Router = agent.NewRouter(e.llm.Client("other-router"))
-	if e.srv.cacheKey(q1, ModeAuto, "") == k1 {
+	if e.srv.l1Key(q1, ModeAuto, "") == k1 {
 		t.Fatal("router model must be part of the cache identity")
 	}
 }

@@ -14,6 +14,7 @@ import (
 
 	"example.com/councilai-starter/internal/agent"
 	"example.com/councilai-starter/internal/api"
+	"example.com/councilai-starter/internal/cache"
 	"example.com/councilai-starter/internal/config"
 	"example.com/councilai-starter/internal/council"
 	"example.com/councilai-starter/internal/llm"
@@ -99,6 +100,39 @@ func startupSummary(cfg *config.Config, clients pipelineClients) []string {
 	return lines
 }
 
+// setupRedis wires the Redis Stack caches. Redis is an optimisation: if it
+// is down at startup the server still starts, the shared breaker opens on
+// failures, and caching resumes when Redis recovers. There is no
+// in-process fallback cache.
+func setupRedis(cfg *config.Config, srv *api.Server) func() {
+	r := cfg.Redis
+	if !r.Enabled {
+		log.Println("Redis caching disabled by configuration (REDIS_ENABLED=false); no cache of any kind is used")
+		return func() {}
+	}
+	client := cache.NewClient(r.Addr, r.Password, r.DB)
+	breaker := cache.NewCircuitBreaker("redis", cache.Config{
+		FailureThreshold: r.FailureThreshold, SuccessThreshold: r.SuccessThreshold,
+		Timeout: r.BreakerTimeout, HalfOpenMaxCalls: 1,
+	})
+	l1 := cache.NewRedisCacheWithBreaker(client, breaker, r.ExactTTL)
+	l1.SetOpTimeout(r.OpTimeout)
+	l2 := cache.NewRedisSemanticCacheWithBreaker(client, breaker, r.SemanticTTL)
+	l2.SetOpTimeout(r.OpTimeout)
+	srv.Cache, srv.Semantic, srv.Breaker, srv.SemanticThreshold = l1, l2, breaker, r.SemanticThreshold
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := l1.Ping(ctx); err != nil {
+		log.Printf("[Redis] not reachable at %s at startup (%v); answering without cache until it recovers", r.Addr, err)
+	} else if err := l2.EnsureIndex(ctx); err != nil {
+		log.Printf("[Redis] semantic index not ready: %v (retried on first use)", err)
+	} else {
+		log.Printf("[Redis] connected to %s; L1 TTL %s, L2 TTL %s, threshold %.2f, index %s", r.Addr, r.ExactTTL, r.SemanticTTL, r.SemanticThreshold, cache.SemanticIndexName)
+	}
+	return func() { _ = client.Close() }
+}
+
 func main() {
 	log.Println("Starting CouncilAI Go backend")
 	cfg, err := config.Load()
@@ -115,6 +149,8 @@ func main() {
 	srv.Router = agent.NewRouter(clients.Router)
 	srv.IngestAgent = agent.NewIngestAgent(clients.Ingestion)
 	srv.WebSearch = cfg.WebSearch
+	closeRedis := setupRedis(cfg, srv)
+	defer closeRedis()
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.ServerPort,
 		Handler:      srv.Routes(),

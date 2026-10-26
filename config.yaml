@@ -7,6 +7,22 @@
 
 server:
   port: "8080"
+  # L2 semantic cache: minimum cosine similarity (1 - distance) for a hit.
+  # Reference default. See README "Semantic cache threshold" for measured
+  # false-positive rates before changing it.
+  semantic_cache_threshold: 0.85
+
+# Redis Stack caches (reference keys). Password comes from REDIS_PASSWORD.
+redis:
+  enabled: true
+  addr: "redis:6379"
+  db: 0                  # RediSearch indexes only work in database 0
+  op_timeout: "500ms"    # per Redis round trip
+  exact_ttl: "1h"        # L1 answers and document summaries
+  semantic_ttl: "24h"    # L2 answers
+  circuit_breaker_failure_threshold: 3
+  circuit_breaker_success_threshold: 2
+  circuit_breaker_timeout: "10s"
 
 rag:
   service_url: "http://python-rag:8000"

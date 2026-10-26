@@ -92,6 +92,10 @@ type QueryResult struct {
 	// reported usage; calls without usage are not estimated.
 	TokenUsage *llm.Usage `json:"token_usage,omitempty"`
 	CacheHit   bool       `json:"cache_hit"`
+	// Cache describes cache lookups and writes for THIS request. On a hit,
+	// TokenUsage and DurationMS describe this request (no council ran);
+	// the original generation's figures are in Cache.Original*.
+	Cache      *CacheInfo `json:"cache,omitempty"`
 	DurationMS int64      `json:"duration_ms"`
 }
 
@@ -189,6 +193,23 @@ type RoutingInfo struct {
 	GroundingError string `json:"grounding_error,omitempty"`
 	// WebSources attributes web results when Grounding is "web".
 	WebSources []WebSource `json:"web_sources,omitempty"`
+}
+
+// CacheInfo reports cache behaviour for one request.
+type CacheInfo struct {
+	Tier               string     `json:"tier"`                 // "l1_exact" | "l2_semantic" | "none"
+	L1                 string     `json:"l1"`                   // hit | miss | error | circuit_open | corrupt_entry | disabled
+	L2                 string     `json:"l2"`                   // hit | miss | ineligible | embed_failed | error | circuit_open | disabled
+	LookupMS           float64    `json:"lookup_ms"`            // time spent in cache lookups (and the L2 embedding)
+	Distance           *float64   `json:"distance,omitempty"`   // L2 hit: cosine distance
+	Similarity         *float64   `json:"similarity,omitempty"` // L2 hit: 1 - distance
+	Threshold          *float64   `json:"threshold,omitempty"`  // L2 similarity threshold in force
+	InferenceExecuted  bool       `json:"inference_executed"`   // did the council/direct model run for this request
+	RouterCalled       bool       `json:"router_called"`
+	Stored             []string   `json:"stored,omitempty"` // tiers written by this request
+	WriteError         string     `json:"write_error,omitempty"`
+	OriginalTokenUsage *llm.Usage `json:"original_token_usage,omitempty"`
+	OriginalDurationMS int64      `json:"original_duration_ms,omitempty"`
 }
 
 // RetrievalInfo is what the RAG service reported for a document retrieval.

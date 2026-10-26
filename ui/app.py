@@ -86,6 +86,18 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
             st.write(result.get("answer", ""))
             st.caption(f"Strategy: {result.get('strategy')} | Server latency: {result.get('duration_ms')} ms | Cache hit: {result.get('cache_hit')}")
             st.caption(f"Answer source: {result.get('source', '')} | Peer reviewed: {result.get('peer_reviewed', False)} | Top peer-ranked: {result.get('selected') or '—'}")
+            cinfo = result.get("cache") or {}
+            if cinfo:
+                tier = {"l1_exact": "exact (L1)", "l2_semantic": "semantic (L2)"}.get(cinfo.get("tier"), "miss")
+                line = f"Cache: {tier} · L1 {cinfo.get('l1')} · L2 {cinfo.get('l2')} · lookup {cinfo.get('lookup_ms')} ms"
+                if cinfo.get("similarity") is not None:
+                    line += f" · similarity {cinfo['similarity']:.3f} (threshold {cinfo.get('threshold')})"
+                line += " · models ran for this request" if cinfo.get("inference_executed") else " · no council/direct model ran for this request"
+                if cinfo.get("stored"):
+                    line += " · stored in " + ", ".join(cinfo["stored"])
+                st.caption(line)
+                if cinfo.get("write_error"):
+                    st.caption(f"Cache write skipped: {cinfo['write_error']}")
             routing = result.get("routing") or {}
             if routing:
                 how = "LLM router" if routing.get("mode") == "auto" else "explicit override (diagnostic)"

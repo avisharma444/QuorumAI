@@ -16,10 +16,11 @@ import (
 // Summary statuses reported in the ingestion response.
 const (
 	summaryGenerated = "generated"
-	summaryFailed    = "failed"    // model error; ingestion still succeeds
-	summarySkipped   = "skipped"   // empty preview text
-	summaryDisabled  = "disabled"  // no ingestion agent configured
-	summaryCancelled = "cancelled" // client went away during summarization
+	summaryFailed    = "failed"     // model error; ingestion still succeeds
+	summarySkipped   = "skipped"    // empty preview text
+	summaryDisabled  = "disabled"   // no ingestion agent configured
+	summaryCancelled = "cancelled"  // client went away during summarization
+	summaryNotStored = "not_stored" // generated, but Redis rejected the write
 )
 
 func multipartWriter(buf *bytes.Buffer, filename string, source io.Reader) string {
@@ -128,7 +129,12 @@ func (s *Server) summarizeDocument(ctx context.Context, docID, preview string) (
 		log.Printf("[Ingest] Summarization failed for doc %s: %v", docID, err)
 		return summaryFailed, "", err.Error()
 	}
-	s.Summaries.Set(docID, summary)
+	if err := s.setSummary(context.WithoutCancel(ctx), docID, summary); err != nil {
+		// The summary exists but could not be stored; queries will use the
+		// missing-summary rule (document kept).
+		log.Printf("[Ingest] Summary for doc %s not stored: %v", docID, err)
+		return summaryNotStored, summary, err.Error()
+	}
 	log.Printf("[Ingest] Generated and cached summary for doc %s", docID)
 	return summaryGenerated, summary, ""
 }

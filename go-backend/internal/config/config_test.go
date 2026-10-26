@@ -176,3 +176,30 @@ func TestWebSearchSwitch(t *testing.T) {
 		t.Fatal("invalid boolean accepted")
 	}
 }
+
+func TestRedisConfig(t *testing.T) {
+	cfg, err := LoadFrom(repoConfig, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Redis
+	if !r.Enabled || r.Addr != "redis:6379" || r.DB != 0 || r.ExactTTL != time.Hour || r.SemanticTTL != 24*time.Hour ||
+		r.SemanticThreshold != 0.85 || r.FailureThreshold != 3 || r.SuccessThreshold != 2 || r.BreakerTimeout != 10*time.Second || r.OpTimeout != 500*time.Millisecond {
+		t.Fatalf("reference defaults: %+v", r)
+	}
+	cfg, err = LoadFrom(repoConfig, env(map[string]string{"REDIS_ADDR": "cache:6380", "REDIS_PASSWORD": "pw", "SEMANTIC_CACHE_THRESHOLD": "0.92", "REDIS_ENABLED": "false", "CIRCUIT_BREAKER_TIMEOUT": "3s"}))
+	if err != nil || cfg.Redis.Addr != "cache:6380" || cfg.Redis.Password != "pw" || cfg.Redis.SemanticThreshold != 0.92 || cfg.Redis.Enabled || cfg.Redis.BreakerTimeout != 3*time.Second {
+		t.Fatalf("overrides: %+v %v", cfg.Redis, err)
+	}
+	for name, vars := range map[string]map[string]string{
+		"non-zero db":    {"REDIS_DB": "2"},
+		"threshold > 1":  {"SEMANTIC_CACHE_THRESHOLD": "1.5"},
+		"threshold text": {"SEMANTIC_CACHE_THRESHOLD": "high"},
+		"bad ttl":        {"REDIS_SEMANTIC_TTL": "forever"},
+		"zero failures":  {"CIRCUIT_BREAKER_FAILURE_THRESHOLD": "0"},
+	} {
+		if _, err := LoadFrom(repoConfig, env(vars)); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}
