@@ -58,7 +58,7 @@ DATABASE_PATH=./documents.sqlite3 uvicorn app.main:app --reload --port 8000
 
 # Terminal B, from project root
 cd go-backend
-MOCK_LLM=true RAG_URL=http://localhost:8000 go run .
+MOCK_LLM=true RAG_SERVICE_URL=http://localhost:8000 go run ./cmd/server
 
 # Optional terminal C
 pip install -r ui/requirements.txt
@@ -82,19 +82,31 @@ curl -N -X POST http://localhost:8080/api/v1/query \
 
 Valid strategies: `auto`, `direct`, `council`, `council_deep`. `auto` currently uses **simple deterministic heuristics**; it is not an LLM router yet.
 
-### Use a real model API
+### Use real model providers
 
-Edit `.env`:
+Models are chosen in `config.yaml` (repository root), one entry per role:
+three council `slots`, plus `chairman`, `router` and `ingestion`. Each entry
+has a `provider` (`gemini`, `openrouter`, `nvidia-nim`, or `local` for vLLM)
+and a `model`. Any entry can be overridden with environment variables such as
+`COUNCIL_2_PROVIDER` / `COUNCIL_2_MODEL` or `CHAIRMAN_MODEL`.
+
+API keys are read only from the environment. Edit `.env`:
 
 ```dotenv
 MOCK_LLM=false
-MODEL_API_KEY=replace-me
-MODEL_BASE_URL=https://openrouter.ai/api/v1
-COUNCIL_MODELS=provider/model-1,provider/model-2,provider/model-3
-CHAIR_MODEL=provider/fast-chair-model
+GEMINI_API_KEY=replace-me        # needed if any role uses gemini
+OPENROUTER_API_KEY=replace-me    # needed if any role uses openrouter
+NVIDIA_NIM_API_KEY=replace-me    # needed if any role uses nvidia-nim
 ```
 
-Replace example provider/model identifiers with currently available OpenRouter identifiers. Check provider pricing first. The Go client currently targets **OpenAI-compatible chat completions**, so native Gemini APIs are *not* supported directly. Mock mode does not estimate costs and cannot evaluate answer quality. A complete council request can make 7+ LLM calls (3 candidates + 3 peer reviews + chairman; more in deep mode).
+Startup validates everything and fails with a list of every problem (missing
+keys, unknown providers, bad durations). It never falls back to mock answers.
+The old variables `MODEL_API_KEY`, `MODEL_BASE_URL`, `COUNCIL_MODELS`,
+`CHAIR_MODEL` and `RAG_URL` are rejected with a pointer to their replacements.
+
+Check provider pricing first. A complete council request makes 7+ model calls
+(3 candidates + 3 peer reviews + chairman; more in deep mode). Responses
+include provider-reported token usage per call and in total (`token_usage`).
 
 ### Tests and benchmarks
 

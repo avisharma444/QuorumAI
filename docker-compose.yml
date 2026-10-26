@@ -20,7 +20,9 @@ services:
     env_file:
       - .env
     environment:
-      - RAG_URL=http://python-rag:8000
+      - RAG_SERVICE_URL=http://python-rag:8000
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
     depends_on:
       python-rag:
         condition: service_healthy

@@ -67,12 +67,23 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
             st.write(result.get("answer", ""))
             st.caption(f"Strategy: {result.get('strategy')} | Server latency: {result.get('duration_ms')} ms | Cache hit: {result.get('cache_hit')}")
             st.caption(f"Answer source: {result.get('source', '')} | Peer reviewed: {result.get('peer_reviewed', False)} | Top peer-ranked: {result.get('selected') or '—'}")
+            usage = result.get("token_usage")
+            st.caption(f"Token usage (provider-reported): {usage['total_tokens']} total" if usage else "Token usage: not reported by the providers")
             st.caption(result.get("confidence_note", ""))
             with st.expander("Candidate responses"):
                 for c in result.get("candidates", []):
                     label = f"Response {c['label']} — " if c.get("label") else ""
                     score = f" (peer score {c['score']})" if c.get("score") else ""
                     st.markdown(f"**{label}{c['model']}**{score}")
+                    details = []
+                    if c.get("served_model") and c["served_model"] != c["model"]:
+                        details.append(f"served by {c['served_model']}")
+                    if c.get("usage"):
+                        details.append(f"{c['usage']['total_tokens']} tokens")
+                    if c.get("error"):
+                        details.append(f"error: {c['error']}")
+                    if details:
+                        st.caption(" | ".join(details))
                     st.write(c.get("answer", ""))
             with st.expander("Peer review and evidence"):
                 reviews = result.get("reviews", [])

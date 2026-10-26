@@ -1,4 +1,6 @@
-package main
+// Package council runs the multi-model deliberation: concurrent candidate
+// generation, anonymous ranked peer review, and chairman synthesis.
+package council
 
 import (
 	"context"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"example.com/councilai-starter/internal/llm"
 )
 
 type QueryRequest struct {
@@ -19,38 +23,44 @@ type QueryRequest struct {
 	TopK     int    `json:"top_k,omitempty"`
 }
 
-// Candidate is one council member's answer. Label is the anonymous name
-// ("A", "B", ...) reviewers saw; it is only set on candidates that survived
-// generation. Score is the total peer-review points it received.
+// Candidate is one council member's answer. Model is the configured client's
+// ModelName; ServedModel is what the provider says actually answered (for
+// example, the model OpenRouter routed "openrouter/free" to). Label is the
+// anonymous name ("A", "B", ...) reviewers saw; it is only set on candidates
+// that survived generation. Score is the total peer-review points it received.
 type Candidate struct {
-	Model     string `json:"model"`
-	Label     string `json:"label,omitempty"`
-	Answer    string `json:"answer"`
-	Score     int    `json:"score,omitempty"`
-	Error     string `json:"error,omitempty"`
-	LatencyMS int64  `json:"latency_ms"`
+	Model       string     `json:"model"`
+	ServedModel string     `json:"served_model,omitempty"`
+	Label       string     `json:"label,omitempty"`
+	Answer      string     `json:"answer"`
+	Score       int        `json:"score,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	LatencyMS   int64      `json:"latency_ms"`
+	Usage       *llm.Usage `json:"usage,omitempty"` // nil when the provider reported none
 }
 
 // Review is one reviewer's ranking of the anonymous candidates. Index is the
 // reviewer's slot in the configured council, kept even when the review fails.
 // A review counts toward selection only when Error is empty.
 type Review struct {
-	Index     int            `json:"index"`
-	Reviewer  string         `json:"reviewer"`
-	Raw       string         `json:"raw,omitempty"`
-	Ranking   []string       `json:"ranking,omitempty"`
-	Reasoning string         `json:"reasoning,omitempty"`
-	Scores    map[string]int `json:"scores,omitempty"`
-	Error     string         `json:"error,omitempty"`
-	LatencyMS int64          `json:"latency_ms"`
+	Index       int            `json:"index"`
+	Reviewer    string         `json:"reviewer"`
+	ServedModel string         `json:"served_model,omitempty"`
+	Raw         string         `json:"raw,omitempty"`
+	Ranking     []string       `json:"ranking,omitempty"`
+	Reasoning   string         `json:"reasoning,omitempty"`
+	Scores      map[string]int `json:"scores,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	LatencyMS   int64          `json:"latency_ms"`
+	Usage       *llm.Usage     `json:"usage,omitempty"`
 }
 
 type QueryResult struct {
 	Answer         string `json:"answer"`
 	Strategy       string `json:"strategy"`
 	ConfidenceNote string `json:"confidence_note"`
-	// Source says how Answer was produced, e.g. "chairman:model-a" or
-	// "model-b (chairman-failed-fallback)".
+	// Source says how Answer was produced, e.g. "chairman:gemini:gemini-2.5-flash"
+	// or "model-b (chairman-failed-fallback)".
 	Source       string      `json:"source"`
 	PeerReviewed bool        `json:"peer_reviewed"`
 	Selected     string      `json:"selected,omitempty"` // label of the top peer-ranked candidate
@@ -58,32 +68,48 @@ type QueryResult struct {
 	Reviews      []Review    `json:"reviews,omitempty"`
 	Reflection   string      `json:"reflection,omitempty"`
 	Sources      []string    `json:"sources,omitempty"`
-	CacheHit     bool        `json:"cache_hit"`
-	DurationMS   int64       `json:"duration_ms"`
+	// TokenUsage sums provider-reported usage over every call in this request
+	// (candidates, reviews, chairman, reflection). Nil when no provider
+	// reported usage; calls without usage are not estimated.
+	TokenUsage *llm.Usage `json:"token_usage,omitempty"`
+	CacheHit   bool       `json:"cache_hit"`
+	DurationMS int64      `json:"duration_ms"`
 }
 
 type EventFn func(string, any)
+
+// Council holds one independently configured client per member and a
+// separate chairman client (also used for direct answers and reflection,
+// as in the reference).
 type Council struct {
-	Provider Model
-	Members  []string
-	Chair    string
-	Timeout  time.Duration
+	Members      []llm.LLMClient
+	Chairman     llm.LLMClient
+	StageTimeout time.Duration // per model call; 0 means 30s
+}
+
+// New builds a council.
+func New(members []llm.LLMClient, chairman llm.LLMClient, stageTimeout time.Duration) *Council {
+	return &Council{Members: members, Chairman: chairman, StageTimeout: stageTimeout}
 }
 
 // Candidates are labelled A–Z, so a council can have at most 26 members.
 const maxCandidates = 26
 
 const (
-	memberSystem   = "COUNCIL_MEMBER: independently answer using the evidence; never invent facts."
-	reviewSystem   = "REVIEW_AGENT: evaluate the anonymized answers and reply in exactly the requested format."
-	chairmanSystem = `CHAIRMAN_AGENT: You are the Chairman of an AI council. Multiple AI models have independently answered a question, and their peers have reviewed and ranked the answers. Your job is to synthesize the best possible final answer.
+	memberSystem     = "COUNCIL_MEMBER: independently answer using the evidence; never invent facts."
+	reviewSystem     = "REVIEW_AGENT: evaluate the anonymized answers and reply in exactly the requested format."
+	directSystem     = "DIRECT_AGENT: respond to the question using only supported evidence."
+	reflectionSystem = "REFLECTION_AGENT: critically review the answer; JSON {\"quality\":\"good|needs_revision\",\"reason\":\"...\"}."
+	reviseSystem     = "CHAIRMAN_AGENT: revise your prior answer according to critique and source evidence."
+	chairmanSystem   = `CHAIRMAN_AGENT: You are the Chairman of an AI council. Multiple AI models have independently answered a question, and their peers have reviewed and ranked the answers. Your job is to synthesize the best possible final answer.
 
 1. Consider all responses and the peer review feedback.
 2. Identify the strongest and weakest points across all answers.
 3. Synthesize a single, authoritative final answer grounded in the supplied evidence, and acknowledge uncertainty.`
 )
 
-func strategyFor(q QueryRequest) (string, error) {
+// StrategyFor resolves "auto" with simple rules and validates the rest.
+func StrategyFor(q QueryRequest) (string, error) {
 	s := strings.TrimSpace(strings.ToLower(q.Strategy))
 	if s == "" || s == "auto" {
 		lower := strings.ToLower(q.Question)
@@ -106,14 +132,53 @@ func promptFor(question string, sources []string) string {
 	return fmt.Sprintf("QUESTION:\n%s\n\nCONTEXT:\n%s\n\nAnswer accurately. When evidence is insufficient, say so; do not invent citations.", question, contextText)
 }
 
-func (c *Council) call(ctx context.Context, model, system, prompt string) (string, error) {
-	timeout := c.Timeout
+// call sends one system + user conversation with the per-stage timeout.
+// tune, if non-nil, adjusts the options (temperature, JSON mode, search).
+func (c *Council) call(ctx context.Context, client llm.LLMClient, system, user string, tune func(*llm.GenerateOptions)) (*llm.Response, error) {
+	timeout := c.StageTimeout
 	if timeout == 0 {
-		timeout = 35 * time.Second
+		timeout = 30 * time.Second
 	}
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return c.Provider.Generate(child, model, system, prompt)
+	opts := llm.GenerateOptions{Messages: []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}}}
+	if tune != nil {
+		tune(&opts)
+	}
+	resp, err := client.GenerateChat(child, opts)
+	if err == nil && resp == nil {
+		err = errors.New("provider returned no response")
+	}
+	return resp, err
+}
+
+// searchFor enables Gemini search grounding only when no document evidence
+// was supplied, matching the reference.
+func searchFor(client llm.LLMClient, sources []string) func(*llm.GenerateOptions) {
+	return func(o *llm.GenerateOptions) {
+		o.EnableSearch = len(sources) == 0 && strings.HasPrefix(client.ModelName(), "gemini:")
+	}
+}
+
+// reported returns a copy of the usage, or nil if the provider sent none.
+func reported(resp *llm.Response) *llm.Usage {
+	if resp == nil || !resp.Usage.Reported() {
+		return nil
+	}
+	u := resp.Usage
+	return &u
+}
+
+func addUsage(total **llm.Usage, u *llm.Usage) {
+	if u == nil {
+		return
+	}
+	if *total == nil {
+		*total = &llm.Usage{}
+	}
+	(*total).PromptTokens += u.PromptTokens
+	(*total).CompletionTokens += u.CompletionTokens
+	(*total).TotalTokens += u.TotalTokens
 }
 
 func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emit EventFn) (QueryResult, error) {
@@ -121,7 +186,7 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 		emit = func(string, any) {}
 	}
 	started := time.Now()
-	strategy, err := strategyFor(q)
+	strategy, err := StrategyFor(q)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -137,14 +202,18 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 		emit("fallback", map[string]string{"reason": reason, "source": result.Source})
 		return finish()
 	}
+	if c.Chairman == nil {
+		return result, errors.New("no chairman model configured")
+	}
 	prompt := promptFor(q.Question, sources)
 	if strategy == "direct" {
-		answer, err := c.call(ctx, c.Chair, "DIRECT_AGENT: respond to the question using only supported evidence.", prompt)
+		resp, err := c.call(ctx, c.Chairman, directSystem, prompt, searchFor(c.Chairman, sources))
 		if err != nil {
 			return result, err
 		}
-		result.Answer = answer
-		result.Source = "direct:" + c.Chair
+		addUsage(&result.TokenUsage, reported(resp))
+		result.Answer = resp.Answer
+		result.Source = "direct:" + c.Chairman.ModelName()
 		return finish()
 	}
 	if len(c.Members) == 0 {
@@ -156,7 +225,8 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 
 	// Stage 1: every member answers in parallel. Survivors keep configuration
 	// order and get anonymous labels A, B, C... in that order.
-	for _, cand := range c.generateCandidates(ctx, prompt, emit) {
+	for _, cand := range c.generateCandidates(ctx, prompt, sources, emit) {
+		addUsage(&result.TokenUsage, cand.Usage)
 		if cand.Error == "" {
 			cand.Label = labelFor(len(result.Candidates))
 			result.Candidates = append(result.Candidates, cand)
@@ -174,6 +244,9 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 
 	// Stage 2: every configured member ranks the anonymous candidates.
 	result.Reviews = c.peerReview(ctx, q.Question, result.Candidates, emit)
+	for _, r := range result.Reviews {
+		addUsage(&result.TokenUsage, r.Usage)
+	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
@@ -190,9 +263,12 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 	result.PeerReviewed = true
 
 	// Stage 3: the chairman synthesizes from candidates plus valid reviews.
-	answer, err := c.call(ctx, c.Chair, chairmanSystem, chairmanPrompt(prompt, result.Candidates, result.Reviews))
-	if err == nil && strings.TrimSpace(answer) == "" {
-		err = errors.New("empty chairman response")
+	resp, err := c.call(ctx, c.Chairman, chairmanSystem, chairmanPrompt(prompt, result.Candidates, result.Reviews), nil)
+	if err == nil {
+		addUsage(&result.TokenUsage, reported(resp))
+		if strings.TrimSpace(resp.Answer) == "" {
+			err = errors.New("empty chairman response")
+		}
 	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -200,8 +276,8 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 		}
 		return fallback(best, "chairman-failed-fallback", "chairman unavailable; returning the top peer-ranked candidate")
 	}
-	result.Answer = answer
-	result.Source = "chairman:" + c.Chair
+	result.Answer = resp.Answer
+	result.Source = "chairman:" + c.Chairman.ModelName()
 
 	// Stage 4 (council_deep only): reflect on, and possibly revise, the
 	// chairman's answer. Fallback answers above never reach this point.
@@ -211,24 +287,27 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, sources []string, emi
 	return finish()
 }
 
-func (c *Council) generateCandidates(ctx context.Context, prompt string, emit EventFn) []Candidate {
+func (c *Council) generateCandidates(ctx context.Context, prompt string, sources []string, emit EventFn) []Candidate {
 	out := make([]Candidate, len(c.Members))
 	var wg sync.WaitGroup
-	for i, model := range c.Members {
+	for i, member := range c.Members {
 		wg.Add(1)
-		go func(i int, model string) {
+		go func(i int, member llm.LLMClient) {
 			defer wg.Done()
 			start := time.Now()
-			text, err := c.call(ctx, model, memberSystem, prompt)
-			cand := Candidate{Model: model, Answer: text, LatencyMS: time.Since(start).Milliseconds()}
+			resp, err := c.call(ctx, member, memberSystem, prompt, searchFor(member, sources))
+			cand := Candidate{Model: member.ModelName(), LatencyMS: time.Since(start).Milliseconds()}
 			if err != nil {
-				cand.Answer, cand.Error = "", err.Error()
-			} else if strings.TrimSpace(text) == "" {
-				cand.Error = "empty response"
+				cand.Error = err.Error()
+			} else {
+				cand.Answer, cand.ServedModel, cand.Usage = resp.Answer, resp.Model, reported(resp)
+				if strings.TrimSpace(resp.Answer) == "" {
+					cand.Error = "empty response"
+				}
 			}
 			out[i] = cand
 			emit("candidate", cand)
-		}(i, model)
+		}(i, member)
 	}
 	wg.Wait()
 	return out
@@ -238,19 +317,19 @@ func (c *Council) peerReview(ctx context.Context, question string, cands []Candi
 	prompt := reviewPrompt(question, cands)
 	reviews := make([]Review, len(c.Members))
 	var wg sync.WaitGroup
-	for i, model := range c.Members {
+	for i, member := range c.Members {
 		wg.Add(1)
-		go func(i int, model string) {
+		go func(i int, member llm.LLMClient) {
 			defer wg.Done()
 			start := time.Now()
-			raw, err := c.call(ctx, model, reviewSystem, prompt)
-			r := Review{Index: i, Reviewer: model, LatencyMS: time.Since(start).Milliseconds()}
+			resp, err := c.call(ctx, member, reviewSystem, prompt, nil)
+			r := Review{Index: i, Reviewer: member.ModelName(), LatencyMS: time.Since(start).Milliseconds()}
 			if err != nil {
 				r.Error = "review request failed: " + err.Error()
 			} else {
-				r.Raw = raw
-				r.Reasoning = extractReasoning(raw)
-				if ranking, perr := parseRanking(raw, len(cands)); perr != nil {
+				r.Raw, r.ServedModel, r.Usage = resp.Answer, resp.Model, reported(resp)
+				r.Reasoning = extractReasoning(resp.Answer)
+				if ranking, perr := parseRanking(resp.Answer, len(cands)); perr != nil {
 					r.Error = "invalid ranking: " + perr.Error()
 				} else {
 					r.Ranking, r.Scores = rankingLabels(ranking), scoreRanking(ranking)
@@ -262,31 +341,39 @@ func (c *Council) peerReview(ctx context.Context, question string, cands []Candi
 			} else {
 				emit("review", r)
 			}
-		}(i, model)
+		}(i, member)
 	}
 	wg.Wait()
 	return reviews
 }
 
+// reflect uses the chairman client with the reference's reflection
+// settings: low temperature, JSON output, at most 500 tokens.
 func (c *Council) reflect(ctx context.Context, prompt string, result *QueryResult, emit EventFn) {
-	raw, err := c.call(ctx, c.Chair, "REFLECTION_AGENT: critically review the answer; JSON {\"quality\":\"good|needs_revision\",\"reason\":\"...\"}.", prompt+"\n\nPROPOSED ANSWER:\n"+result.Answer)
+	resp, err := c.call(ctx, c.Chairman, reflectionSystem, prompt+"\n\nPROPOSED ANSWER:\n"+result.Answer, func(o *llm.GenerateOptions) {
+		o.Temperature, o.ResponseJSON, o.MaxTokens = llm.Float64Ptr(0.2), true, 500
+	})
 	if err != nil {
 		return
 	}
+	addUsage(&result.TokenUsage, reported(resp))
 	var reflection struct {
 		Quality string `json:"quality"`
 		Reason  string `json:"reason"`
 	}
-	if json.Unmarshal([]byte(extractJSONObject(raw)), &reflection) != nil {
+	if json.Unmarshal([]byte(extractJSONObject(resp.Answer)), &reflection) != nil {
 		return
 	}
 	result.Reflection = reflection.Quality + ": " + reflection.Reason
 	emit("reflection", reflection)
 	if reflection.Quality == "needs_revision" {
-		revised, err := c.call(ctx, c.Chair, "CHAIRMAN_AGENT: revise your prior answer according to critique and source evidence.", prompt+"\nPrior: "+result.Answer+"\nCritique: "+reflection.Reason)
-		if err == nil && strings.TrimSpace(revised) != "" {
-			result.Answer = revised
-			result.Source = "chairman-revised:" + c.Chair
+		revised, err := c.call(ctx, c.Chairman, reviseSystem, prompt+"\nPrior: "+result.Answer+"\nCritique: "+reflection.Reason, nil)
+		if err == nil {
+			addUsage(&result.TokenUsage, reported(revised))
+			if strings.TrimSpace(revised.Answer) != "" {
+				result.Answer = revised.Answer
+				result.Source = "chairman-revised:" + c.Chairman.ModelName()
+			}
 		}
 	}
 }

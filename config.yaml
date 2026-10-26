@@ -1,0 +1,41 @@
+# CouncilAI reproduction configuration (same structure as the reference
+# config.yaml, limited to the sections implemented so far).
+# API keys are NOT read from this file. Set them as environment variables:
+#   GEMINI_API_KEY, OPENROUTER_API_KEY, NVIDIA_NIM_API_KEY
+# Every setting below can also be overridden by an environment variable, e.g.
+# COUNCIL_1_PROVIDER / COUNCIL_1_MODEL, CHAIRMAN_PROVIDER, STAGE_TIMEOUT.
+
+server:
+  port: "8080"
+
+rag:
+  service_url: "http://python-rag:8000"
+
+providers:
+  openrouter_url: "https://openrouter.ai/api/v1/chat/completions"
+  gemini_url: "https://generativelanguage.googleapis.com/v1beta"
+  nvidia_nim_url: "https://integrate.api.nvidia.com/v1/chat/completions"
+  vllm_url: "http://vllm-inference:8001/v1/chat/completions"
+
+council:
+  size: 3
+  slots: # provider: gemini | openrouter | nvidia-nim | local (vLLM)
+    - provider: "openrouter"
+      model: "openrouter/free"
+    - provider: "openrouter"
+      model: "openrouter/free"
+    - provider: "openrouter"
+      model: "openrouter/free"
+  chairman:
+    provider: "gemini"
+    model: "gemini-2.5-flash"
+  router: # configured and validated now; used from the routing phase
+    provider: "gemini"
+    model: "gemini-2.5-flash"
+  ingestion: # configured and validated now; used from the ingestion-agent phase
+    provider: "gemini"
+    model: "gemini-2.5-flash"
+  timeouts:
+    stage: "30s"    # per model call inside a stage
+    llm: "120s"     # HTTP client timeout for council members
+    request: "120s" # whole query

@@ -1,94 +1,18 @@
-package main
+package council
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"example.com/councilai-starter/internal/llm/llmtest"
 )
 
 // ── Test doubles ────────────────────────────────────────────────────
-
-// stageOf maps a system prompt to the pipeline stage that sent it.
-func stageOf(system string) string {
-	switch {
-	case strings.HasPrefix(system, "REFLECTION_AGENT"):
-		return "reflect"
-	case strings.HasPrefix(system, "CHAIRMAN_AGENT: revise"):
-		return "revise"
-	case strings.HasPrefix(system, "CHAIRMAN_AGENT"):
-		return "chair"
-	case strings.HasPrefix(system, "REVIEW_AGENT"):
-		return "review"
-	case strings.HasPrefix(system, "COUNCIL_MEMBER"):
-		return "member"
-	case strings.HasPrefix(system, "DIRECT_AGENT"):
-		return "direct"
-	}
-	return "unknown"
-}
-
-type reply struct {
-	text string
-	err  error
-}
-
-// fakeModel returns scripted replies keyed by "stage/model" and records every
-// call. Unscripted calls fall back to MockModel. hook, if set, runs before
-// the reply and can block or fail the call.
-type fakeModel struct {
-	mu      sync.Mutex
-	replies map[string]reply
-	calls   map[string]int
-	prompts map[string]string
-	hook    func(ctx context.Context, stage, model string) error
-}
-
-func newFake(replies map[string]reply) *fakeModel {
-	if replies == nil {
-		replies = map[string]reply{}
-	}
-	return &fakeModel{replies: replies, calls: map[string]int{}, prompts: map[string]string{}}
-}
-
-func (f *fakeModel) Generate(ctx context.Context, model, system, prompt string) (string, error) {
-	stage := stageOf(system)
-	key := stage + "/" + model
-	f.mu.Lock()
-	f.calls[stage]++
-	f.prompts[key] = prompt
-	r, scripted := f.replies[key]
-	f.mu.Unlock()
-	if f.hook != nil {
-		if err := f.hook(ctx, stage, model); err != nil {
-			return "", err
-		}
-	}
-	if !scripted {
-		return (&MockModel{}).Generate(ctx, model, system, prompt)
-	}
-	return r.text, r.err
-}
-
-func (f *fakeModel) count(stage string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.calls[stage]
-}
-
-func (f *fakeModel) prompt(stage, model string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.prompts[stage+"/"+model]
-}
 
 // eventLog collects emitted events safely from many goroutines.
 type eventLog struct {
@@ -115,18 +39,18 @@ func (e *eventLog) has(name string) bool {
 	return false
 }
 
-func testCouncil(m Model) *Council {
-	return &Council{Provider: m, Members: []string{"a", "b", "c"}, Chair: "chair", Timeout: 2 * time.Second}
+func testCouncil(f *llmtest.Fake) *Council {
+	return New(f.Clients("a", "b", "c"), f.Client("chair"), 2*time.Second)
 }
 
-func runCouncil(t *testing.T, m Model, strategy string) (QueryResult, *eventLog, error) {
+func runCouncil(t *testing.T, m *llmtest.Fake, strategy string) (QueryResult, *eventLog, error) {
 	t.Helper()
 	log := &eventLog{}
 	res, err := testCouncil(m).Run(context.Background(), QueryRequest{Question: "Compare X and Y", Strategy: strategy}, nil, log.emit)
 	return res, log, err
 }
 
-func mustRun(t *testing.T, m Model, strategy string) (QueryResult, *eventLog) {
+func mustRun(t *testing.T, m *llmtest.Fake, strategy string) (QueryResult, *eventLog) {
 	t.Helper()
 	res, log, err := runCouncil(t, m, strategy)
 	if err != nil {
@@ -135,7 +59,9 @@ func mustRun(t *testing.T, m Model, strategy string) (QueryResult, *eventLog) {
 	return res, log
 }
 
-func ranking(r string) reply { return reply{text: "RANKING: " + r + "\nREASONING: because."} }
+func ranking(r string) llmtest.Reply {
+	return llmtest.Reply{Text: "RANKING: " + r + "\nREASONING: because."}
+}
 
 var errProvider = errors.New("provider down")
 
@@ -273,11 +199,11 @@ func TestTieBreakIsDeterministic(t *testing.T) {
 // ── Full pipeline ───────────────────────────────────────────────────
 
 func TestNonFirstCandidateWinsByWeightedRanking(t *testing.T) {
-	f := newFake(map[string]reply{
+	f := llmtest.New(map[string]llmtest.Reply{
 		"review/a":    ranking("B, A, C"),
 		"review/b":    ranking("B, C, A"),
 		"review/c":    ranking("A, B, C"),
-		"chair/chair": {text: "chairman synthesis"},
+		"chair/chair": {Text: "chairman synthesis"},
 	})
 	res, _ := mustRun(t, f, "council")
 	if res.Selected != "B" || res.Answer != "chairman synthesis" || res.Source != "chairman:chair" || !res.PeerReviewed {
@@ -292,7 +218,7 @@ func TestNonFirstCandidateWinsByWeightedRanking(t *testing.T) {
 		r.Reasoning != "because." || r.Raw == "" || r.Scores["B"] != 3 || r.Scores["A"] != 1 {
 		t.Fatalf("review not fully recorded: %+v", r)
 	}
-	chair := f.prompt("chair", "chair")
+	chair := f.Prompt("chair", "chair")
 	for _, want := range []string{"=== Response A ===", "=== Response C ===", "--- Reviewer 1 ---", "--- Reviewer 3 ---", "RANKING: B, C, A"} {
 		if !strings.Contains(chair, want) {
 			t.Fatalf("chairman prompt missing %q:\n%s", want, chair)
@@ -301,13 +227,13 @@ func TestNonFirstCandidateWinsByWeightedRanking(t *testing.T) {
 }
 
 func TestEqualScoresResolveToEarliestCandidate(t *testing.T) {
-	f := newFake(map[string]reply{
+	f := llmtest.New(map[string]llmtest.Reply{
 		"review/a":    ranking("B, A, C"),
 		"review/b":    ranking("A, B, C"),
-		"review/c":    {err: errProvider},
-		"chair/chair": {err: errProvider},
-		"member/a":    {text: "answer one"},
-		"member/b":    {text: "answer two"},
+		"review/c":    {Err: errProvider},
+		"chair/chair": {Err: errProvider},
+		"member/a":    {Text: "answer one"},
+		"member/b":    {Text: "answer two"},
 	})
 	res, _ := mustRun(t, f, "council")
 	if res.Selected != "A" || res.Answer != "answer one" {
@@ -316,16 +242,15 @@ func TestEqualScoresResolveToEarliestCandidate(t *testing.T) {
 }
 
 func TestReviewersSeeAnonymizedAnswers(t *testing.T) {
-	c := &Council{Provider: nil, Members: []string{"secret-gpt", "secret-claude"}, Chair: "chair", Timeout: time.Second}
-	f := newFake(map[string]reply{
-		"member/secret-gpt":    {text: "Answer about X."},
-		"member/secret-claude": {text: "Answer about Y."},
+	f := llmtest.New(map[string]llmtest.Reply{
+		"member/secret-gpt":    {Text: "Answer about X."},
+		"member/secret-claude": {Text: "Answer about Y."},
 	})
-	c.Provider = f
+	c := New(f.Clients("secret-gpt", "secret-claude"), f.Client("chair"), time.Second)
 	if _, err := c.Run(context.Background(), QueryRequest{Question: "Q?", Strategy: "council"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	p := f.prompt("review", "secret-gpt")
+	p := f.Prompt("review", "secret-gpt")
 	if strings.Contains(p, "secret-") {
 		t.Fatalf("review prompt leaks model identity:\n%s", p)
 	}
@@ -339,25 +264,25 @@ func TestReviewersSeeAnonymizedAnswers(t *testing.T) {
 // When member b fails, labels compress to A=a, B=c, and rankings must map back
 // to the right models.
 func TestRankingMapsCorrectlyWhenACandidateFails(t *testing.T) {
-	f := newFake(map[string]reply{
-		"member/a":    {text: "answer from a"},
-		"member/b":    {err: errProvider},
-		"member/c":    {text: "answer from c"},
+	f := llmtest.New(map[string]llmtest.Reply{
+		"member/a":    {Text: "answer from a"},
+		"member/b":    {Err: errProvider},
+		"member/c":    {Text: "answer from c"},
 		"review/a":    ranking("B, A"),
 		"review/b":    ranking("B, A"),
 		"review/c":    ranking("A, B"),
-		"chair/chair": {err: errProvider},
+		"chair/chair": {Err: errProvider},
 	})
 	res, log := mustRun(t, f, "council")
 	if len(res.Candidates) != 2 || res.Candidates[0].Model != "a" || res.Candidates[0].Label != "A" ||
 		res.Candidates[1].Model != "c" || res.Candidates[1].Label != "B" {
 		t.Fatalf("candidates %+v", res.Candidates)
 	}
-	if strings.Contains(f.prompt("review", "a"), "Response C") {
+	if strings.Contains(f.Prompt("review", "a"), "Response C") {
 		t.Fatal("failed candidate must not appear in the review prompt")
 	}
 	// Reviewer b's own answer failed, but it still reviews (reference behaviour).
-	if len(res.Reviews) != 3 || f.count("review") != 3 {
+	if len(res.Reviews) != 3 || f.Count("review") != 3 {
 		t.Fatalf("expected 3 reviewer slots, got %d", len(res.Reviews))
 	}
 	if res.Selected != "B" || res.Answer != "answer from c" || res.Candidates[1].Score != 5 {
@@ -398,8 +323,8 @@ func (b *barrier) wait() error {
 
 func TestCandidatesAndReviewsRunConcurrently(t *testing.T) {
 	barriers := map[string]*barrier{"member": newBarrier(3), "review": newBarrier(3)}
-	f := newFake(nil)
-	f.hook = func(ctx context.Context, stage, model string) error {
+	f := llmtest.New(nil)
+	f.Hook = func(ctx context.Context, stage, model string) error {
 		if b, ok := barriers[stage]; ok {
 			return b.wait()
 		}
@@ -418,8 +343,8 @@ func TestCandidatesAndReviewsRunConcurrently(t *testing.T) {
 
 func TestCancellationStopsTheRun(t *testing.T) {
 	started := make(chan struct{}, 3)
-	f := newFake(nil)
-	f.hook = func(ctx context.Context, stage, model string) error {
+	f := llmtest.New(nil)
+	f.Hook = func(ctx context.Context, stage, model string) error {
 		started <- struct{}{}
 		<-ctx.Done()
 		return ctx.Err()
@@ -433,7 +358,7 @@ func TestCancellationStopsTheRun(t *testing.T) {
 	}()
 	log := &eventLog{}
 	c := testCouncil(f)
-	c.Timeout = time.Minute
+	c.StageTimeout = time.Minute
 	done := make(chan error, 1)
 	go func() {
 		_, err := c.Run(ctx, QueryRequest{Question: "Q", Strategy: "council"}, nil, log.emit)
@@ -447,7 +372,7 @@ func TestCancellationStopsTheRun(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not stop after cancellation")
 	}
-	if f.count("review") != 0 || log.has("final") {
+	if f.Count("review") != 0 || log.has("final") {
 		t.Fatalf("cancelled run continued: events %v", log.names)
 	}
 }
@@ -456,8 +381,8 @@ func TestCancellationStopsTheRun(t *testing.T) {
 // degraded "longest candidate" answer that would then be cached.
 func TestCancellationDuringReviewIsNotAFallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	f := newFake(nil)
-	f.hook = func(c context.Context, stage, model string) error {
+	f := llmtest.New(nil)
+	f.Hook = func(c context.Context, stage, model string) error {
 		if stage == "review" {
 			cancel()
 			<-c.Done()
@@ -472,8 +397,8 @@ func TestCancellationDuringReviewIsNotAFallback(t *testing.T) {
 }
 
 func TestStageTimeoutFailsOnlyTheSlowModel(t *testing.T) {
-	f := newFake(nil)
-	f.hook = func(ctx context.Context, stage, model string) error {
+	f := llmtest.New(nil)
+	f.Hook = func(ctx context.Context, stage, model string) error {
 		if stage == "member" && model == "c" {
 			<-ctx.Done()
 			return ctx.Err()
@@ -481,7 +406,7 @@ func TestStageTimeoutFailsOnlyTheSlowModel(t *testing.T) {
 		return nil
 	}
 	c := testCouncil(f)
-	c.Timeout = 50 * time.Millisecond
+	c.StageTimeout = 50 * time.Millisecond
 	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -494,23 +419,23 @@ func TestStageTimeoutFailsOnlyTheSlowModel(t *testing.T) {
 // ── Failure handling ────────────────────────────────────────────────
 
 func TestAllMembersFail(t *testing.T) {
-	f := newFake(map[string]reply{"member/a": {err: errProvider}, "member/b": {err: errProvider}, "member/c": {text: "   "}})
+	f := llmtest.New(map[string]llmtest.Reply{"member/a": {Err: errProvider}, "member/b": {Err: errProvider}, "member/c": {Text: "   "}})
 	_, log, err := runCouncil(t, f, "council")
 	if err == nil || !strings.Contains(err.Error(), "all council members failed") {
 		t.Fatalf("expected failure, got %v", err)
 	}
-	if f.count("review") != 0 || log.has("final") {
+	if f.Count("review") != 0 || log.has("final") {
 		t.Fatal("no review or final answer after total failure")
 	}
 }
 
 func TestSingleSurvivorSkipsReviewAndChairman(t *testing.T) {
-	f := newFake(map[string]reply{"member/a": {err: errProvider}, "member/b": {text: "only answer"}, "member/c": {err: errProvider}})
+	f := llmtest.New(map[string]llmtest.Reply{"member/a": {Err: errProvider}, "member/b": {Text: "only answer"}, "member/c": {Err: errProvider}})
 	res, log := mustRun(t, f, "council_deep")
 	if res.Answer != "only answer" || res.Source != "b (single-response)" || res.PeerReviewed {
 		t.Fatalf("unexpected: %+v", res)
 	}
-	if f.count("review")+f.count("chair")+f.count("reflect") != 0 {
+	if f.Count("review")+f.Count("chair")+f.Count("reflect") != 0 {
 		t.Fatal("review, chairman and reflection must be skipped")
 	}
 	if !log.has("fallback") || !log.has("final") {
@@ -519,9 +444,9 @@ func TestSingleSurvivorSkipsReviewAndChairman(t *testing.T) {
 }
 
 func TestMixedReviewerOutcomes(t *testing.T) {
-	f := newFake(map[string]reply{
-		"review/a": {err: errProvider},
-		"review/b": {text: "RANKING: A, A, B\nREASONING: A twice."},
+	f := llmtest.New(map[string]llmtest.Reply{
+		"review/a": {Err: errProvider},
+		"review/b": {Text: "RANKING: A, A, B\nREASONING: A twice."},
 		"review/c": ranking("C, B, A"),
 	})
 	res, log := mustRun(t, f, "council")
@@ -538,7 +463,7 @@ func TestMixedReviewerOutcomes(t *testing.T) {
 	if c.Error != "" || c.Scores["C"] != 3 {
 		t.Fatalf("valid review: %+v", c)
 	}
-	chair := f.prompt("chair", "chair")
+	chair := f.Prompt("chair", "chair")
 	if strings.Contains(chair, "A twice") || strings.Contains(chair, "Reviewer 1") || !strings.Contains(chair, "--- Reviewer 3 ---") {
 		t.Fatalf("chairman must only see valid reviews:\n%s", chair)
 	}
@@ -551,13 +476,13 @@ func TestMixedReviewerOutcomes(t *testing.T) {
 // review is invalid, so the longest candidate (b, not a) wins and the
 // chairman is skipped.
 func TestInvalidReviewsNeverVoteForA(t *testing.T) {
-	f := newFake(map[string]reply{
-		"member/a": {text: "short"},
-		"member/b": {text: "the longest answer of all"},
-		"member/c": {text: "medium one"},
-		"review/a": {text: "{}"},
-		"review/b": {text: `{"best_index": 0}`},
-		"review/c": {text: "RANKING: A"},
+	f := llmtest.New(map[string]llmtest.Reply{
+		"member/a": {Text: "short"},
+		"member/b": {Text: "the longest answer of all"},
+		"member/c": {Text: "medium one"},
+		"review/a": {Text: "{}"},
+		"review/b": {Text: `{"best_index": 0}`},
+		"review/c": {Text: "RANKING: A"},
 	})
 	res, log := mustRun(t, f, "council_deep")
 	if res.Answer != "the longest answer of all" || res.Source != "b (peer-review-failed-fallback)" || res.PeerReviewed || res.Selected != "" {
@@ -568,7 +493,7 @@ func TestInvalidReviewsNeverVoteForA(t *testing.T) {
 			t.Fatalf("no score may be invented: %+v", cand)
 		}
 	}
-	if f.count("chair") != 0 || f.count("reflect") != 0 {
+	if f.Count("chair") != 0 || f.Count("reflect") != 0 {
 		t.Fatal("chairman and reflection must be skipped")
 	}
 	if !log.has("fallback") {
@@ -577,23 +502,23 @@ func TestInvalidReviewsNeverVoteForA(t *testing.T) {
 }
 
 func TestAllReviewRequestsFail(t *testing.T) {
-	f := newFake(map[string]reply{
-		"member/a": {text: "short"},
-		"member/b": {text: "also short"},
-		"member/c": {text: "the longest candidate answer here"},
-		"review/a": {err: errProvider}, "review/b": {err: errProvider}, "review/c": {err: errProvider},
+	f := llmtest.New(map[string]llmtest.Reply{
+		"member/a": {Text: "short"},
+		"member/b": {Text: "also short"},
+		"member/c": {Text: "the longest candidate answer here"},
+		"review/a": {Err: errProvider}, "review/b": {Err: errProvider}, "review/c": {Err: errProvider},
 	})
 	res, _ := mustRun(t, f, "council")
-	if res.Source != "c (peer-review-failed-fallback)" || f.count("chair") != 0 || len(res.Reviews) != 3 {
+	if res.Source != "c (peer-review-failed-fallback)" || f.Count("chair") != 0 || len(res.Reviews) != 3 {
 		t.Fatalf("unexpected: %+v", res)
 	}
 }
 
 func TestChairmanFailureReturnsTopRankedNotFirst(t *testing.T) {
-	for name, chair := range map[string]reply{"error": {err: errProvider}, "empty": {text: "  "}} {
+	for name, chair := range map[string]llmtest.Reply{"error": {Err: errProvider}, "empty": {Text: "  "}} {
 		t.Run(name, func(t *testing.T) {
-			f := newFake(map[string]reply{
-				"member/c":    {text: "c's answer"},
+			f := llmtest.New(map[string]llmtest.Reply{
+				"member/c":    {Text: "c's answer"},
 				"review/a":    ranking("C, A, B"),
 				"review/b":    ranking("C, B, A"),
 				"review/c":    ranking("A, C, B"),
@@ -603,7 +528,7 @@ func TestChairmanFailureReturnsTopRankedNotFirst(t *testing.T) {
 			if res.Answer != "c's answer" || res.Source != "c (chairman-failed-fallback)" || res.Selected != "C" || !res.PeerReviewed {
 				t.Fatalf("unexpected: %+v", res)
 			}
-			if f.count("reflect") != 0 || res.Reflection != "" {
+			if f.Count("reflect") != 0 || res.Reflection != "" {
 				t.Fatal("reflection must not run on a fallback answer")
 			}
 			if !log.has("fallback") {
@@ -614,10 +539,10 @@ func TestChairmanFailureReturnsTopRankedNotFirst(t *testing.T) {
 }
 
 func TestDeepReflectionRevisesAfterChairman(t *testing.T) {
-	f := newFake(map[string]reply{
-		"chair/chair":   {text: "draft"},
-		"reflect/chair": {text: `{"quality":"needs_revision","reason":"missing Y"}`},
-		"revise/chair":  {text: "revised answer"},
+	f := llmtest.New(map[string]llmtest.Reply{
+		"chair/chair":   {Text: "draft"},
+		"reflect/chair": {Text: `{"quality":"needs_revision","reason":"missing Y"}`},
+		"revise/chair":  {Text: "revised answer"},
 	})
 	res, log := mustRun(t, f, "council_deep")
 	if res.Answer != "revised answer" || res.Reflection != "needs_revision: missing Y" || res.Source != "chairman-revised:chair" {
@@ -627,164 +552,21 @@ func TestDeepReflectionRevisesAfterChairman(t *testing.T) {
 		t.Fatalf("events %v", log.names)
 	}
 	// Plain council mode never reflects.
-	f2 := newFake(nil)
+	f2 := llmtest.New(nil)
 	mustRun(t, f2, "council")
-	if f2.count("reflect") != 0 {
+	if f2.Count("reflect") != 0 {
 		t.Fatal("council mode must not reflect")
 	}
 }
 
-// ── HTTP integration ────────────────────────────────────────────────
-
-func postQuery(t *testing.T, srv *Server, body string, stream bool) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(body))
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-	rec := httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
-	return rec
-}
-
-type sseEvent struct {
-	name string
-	data string
-}
-
-func parseSSE(t *testing.T, body string) []sseEvent {
-	t.Helper()
-	var events []sseEvent
-	var name string
-	sc := bufio.NewScanner(strings.NewReader(body))
-	for sc.Scan() {
-		line := sc.Text()
-		switch {
-		case strings.HasPrefix(line, "event: "):
-			name = line[7:]
-		case strings.HasPrefix(line, "data: "):
-			if !json.Valid([]byte(line[6:])) {
-				t.Fatalf("invalid JSON in %s event: %s", name, line)
-			}
-			events = append(events, sseEvent{name, line[6:]})
-		}
-	}
-	return events
-}
-
-func TestHTTPJSONResponse(t *testing.T) {
-	srv := NewServer(testCouncil(&MockModel{}), "http://unused.invalid")
-	rec := postQuery(t, srv, `{"question":"Compare A and B","strategy":"council"}`, false)
-	if rec.Code != 200 {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
-	}
-	var out QueryResult
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatal(err)
-	}
-	if len(out.Reviews) != 3 || !reflect.DeepEqual(out.Reviews[0].Ranking, []string{"A", "B", "C"}) || !out.PeerReviewed || out.Selected != "A" {
-		t.Fatalf("unexpected body: %s", rec.Body.String())
-	}
-	if strings.Contains(rec.Body.String(), "best_index") {
-		t.Fatal("old best_index format still present")
-	}
-}
-
-func TestSSEEventOrder(t *testing.T) {
-	srv := NewServer(testCouncil(&MockModel{}), "http://unused.invalid")
-	events := parseSSE(t, postQuery(t, srv, `{"question":"compare A vs B","strategy":"council"}`, true).Body.String())
-	var names []string
-	for _, e := range events {
-		names = append(names, e.name)
-	}
-	want := []string{"start", "retrieved", "candidate", "candidate", "candidate", "review", "review", "review", "final"}
-	if !reflect.DeepEqual(names, want) {
-		t.Fatalf("got events %v, want %v", names, want)
-	}
-	var final QueryResult
-	_ = json.Unmarshal([]byte(events[len(events)-1].data), &final)
-	if !final.PeerReviewed || final.Source != "chairman:chair" {
-		t.Fatalf("final payload: %s", events[len(events)-1].data)
-	}
-}
-
-func TestSSEReviewErrorAndFallbackEvents(t *testing.T) {
-	f := newFake(map[string]reply{"review/a": {err: errProvider}, "chair/chair": {err: errProvider}})
-	srv := NewServer(testCouncil(f), "http://unused.invalid")
-	events := parseSSE(t, postQuery(t, srv, `{"question":"compare","strategy":"council"}`, true).Body.String())
-	seen := map[string]int{}
-	for _, e := range events {
-		seen[e.name]++
-	}
-	if seen["review_error"] != 1 || seen["review"] != 2 || seen["fallback"] != 1 || seen["final"] != 1 {
-		t.Fatalf("events %v", seen)
-	}
-	if events[len(events)-1].name != "final" {
-		t.Fatal("final must be last")
-	}
-}
-
-func TestHTTPCaching(t *testing.T) {
-	f := newFake(nil)
-	srv := NewServer(testCouncil(f), "http://unused.invalid")
-	body := `{"question":"Compare concurrency and parallelism","strategy":"council"}`
-	var first, second QueryResult
-	_ = json.Unmarshal(postQuery(t, srv, body, false).Body.Bytes(), &first)
-	_ = json.Unmarshal(postQuery(t, srv, body, false).Body.Bytes(), &second)
-	if first.CacheHit || !second.CacheHit || srv.Hits.Load() != 1 {
-		t.Fatal("second identical request must be an exact cache hit")
-	}
-	if f.count("member") != 3 || f.count("review") != 3 {
-		t.Fatalf("cache hit must not call models again: %v", f.calls)
-	}
-	if !reflect.DeepEqual(first.Reviews, second.Reviews) {
-		t.Fatal("cached reviews differ")
-	}
-}
-
-func TestDirectModeBypassesPeerReview(t *testing.T) {
-	f := newFake(map[string]reply{"direct/chair": {text: "direct answer"}})
-	srv := NewServer(testCouncil(f), "http://unused.invalid")
-	var out QueryResult
-	_ = json.Unmarshal(postQuery(t, srv, `{"question":"hi","strategy":"direct"}`, false).Body.Bytes(), &out)
-	if out.Answer != "direct answer" || out.Source != "direct:chair" || len(out.Reviews) != 0 {
-		t.Fatalf("unexpected: %+v", out)
-	}
-	if f.count("member")+f.count("review")+f.count("chair") != 0 {
-		t.Fatalf("direct mode called council stages: %v", f.calls)
-	}
-}
-
-func TestDocumentRetrievalFeedsTheCouncil(t *testing.T) {
-	var gotDoc string
-	rag := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		gotDoc, _ = req["doc_id"].(string)
-		fmt.Fprint(w, `{"chunks":[{"text":"The sky is green on Zog.","page":2,"score":0.9}]}`)
-	}))
-	defer rag.Close()
-	f := newFake(nil)
-	srv := NewServer(testCouncil(f), rag.URL)
-	var out QueryResult
-	rec := postQuery(t, srv, `{"question":"What colour is the sky?","doc_id":"doc-1","strategy":"council"}`, false)
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	if gotDoc != "doc-1" || len(out.Sources) != 1 || !strings.Contains(out.Sources[0], "page 2") {
-		t.Fatalf("retrieval not wired: doc=%q body=%s", gotDoc, rec.Body.String())
-	}
-	if !strings.Contains(f.prompt("member", "a"), "The sky is green on Zog.") || !strings.Contains(f.prompt("chair", "chair"), "The sky is green on Zog.") {
-		t.Fatal("evidence missing from member or chairman prompt")
-	}
-}
-
 func TestStrategyValidation(t *testing.T) {
-	if _, err := strategyFor(QueryRequest{Question: "Q", Strategy: "bogus"}); err == nil {
+	if _, err := StrategyFor(QueryRequest{Question: "Q", Strategy: "bogus"}); err == nil {
 		t.Fatal("unknown strategy accepted")
 	}
-	if value, _ := strategyFor(QueryRequest{Question: "hello"}); value != "direct" {
+	if value, _ := StrategyFor(QueryRequest{Question: "hello"}); value != "direct" {
 		t.Fatalf("got %q", value)
 	}
-	if value, _ := strategyFor(QueryRequest{Question: "hello", DocID: "doc1"}); value != "council" {
+	if value, _ := StrategyFor(QueryRequest{Question: "hello", DocID: "doc1"}); value != "council" {
 		t.Fatalf("got %q", value)
 	}
 }

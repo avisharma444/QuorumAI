@@ -1,4 +1,5 @@
-package main
+// Package api serves the HTTP and SSE endpoints and the exact-match cache.
+package api
 
 import (
 	"bytes"
@@ -7,26 +8,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"example.com/councilai-starter/internal/council"
 )
 
-func env(k, fallback string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return fallback
-}
-
 type CacheEntry struct {
-	Data    QueryResult
+	Data    council.QueryResult
 	Expires time.Time
 }
 type MemoryCache struct {
@@ -38,33 +32,35 @@ type MemoryCache struct {
 func NewMemoryCache(ttl time.Duration) *MemoryCache {
 	return &MemoryCache{values: make(map[string]CacheEntry), ttl: ttl}
 }
-func (c *MemoryCache) Get(key string) (QueryResult, bool) {
+func (c *MemoryCache) Get(key string) (council.QueryResult, bool) {
 	c.mu.RLock()
 	value, ok := c.values[key]
 	c.mu.RUnlock()
 	if !ok || time.Now().After(value.Expires) {
-		return QueryResult{}, false
+		return council.QueryResult{}, false
 	}
 	return value.Data, true
 }
-func (c *MemoryCache) Set(key string, value QueryResult) {
+func (c *MemoryCache) Set(key string, value council.QueryResult) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.values[key] = CacheEntry{Data: value, Expires: time.Now().Add(c.ttl)}
 }
 
 type Server struct {
-	Council  *Council
-	RAGURL   string
-	HTTP     *http.Client
-	Cache    *MemoryCache
-	Requests atomic.Uint64
-	Hits     atomic.Uint64
-	Failures atomic.Uint64
+	Council *council.Council
+	RAGURL  string
+	// RequestTimeout bounds one query, including retrieval and every stage.
+	RequestTimeout time.Duration
+	HTTP           *http.Client
+	Cache          *MemoryCache
+	Requests       atomic.Uint64
+	Hits           atomic.Uint64
+	Failures       atomic.Uint64
 }
 
-func NewServer(c *Council, ragURL string) *Server {
-	return &Server{Council: c, RAGURL: strings.TrimRight(ragURL, "/"), HTTP: &http.Client{Timeout: 25 * time.Second}, Cache: NewMemoryCache(time.Hour)}
+func NewServer(c *council.Council, ragURL string) *Server {
+	return &Server{Council: c, RAGURL: strings.TrimRight(ragURL, "/"), RequestTimeout: 120 * time.Second, HTTP: &http.Client{Timeout: 25 * time.Second}, Cache: NewMemoryCache(time.Hour)}
 }
 
 func respond(w http.ResponseWriter, code int, val any) {
@@ -76,7 +72,7 @@ func respondError(w http.ResponseWriter, code int, msg string) {
 	respond(w, code, map[string]string{"error": msg})
 }
 
-func (s *Server) Retrieve(ctx context.Context, q QueryRequest) ([]string, error) {
+func (s *Server) Retrieve(ctx context.Context, q council.QueryRequest) ([]string, error) {
 	if q.DocID == "" {
 		return nil, nil
 	}
@@ -115,7 +111,7 @@ func (s *Server) Retrieve(ctx context.Context, q QueryRequest) ([]string, error)
 	return excerpts, nil
 }
 
-func cacheKey(q QueryRequest, strategy string) string {
+func cacheKey(q council.QueryRequest, strategy string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(q.DocID) + "|" + strings.TrimSpace(strings.ToLower(q.Question)) + "|" + strategy + "|" + strconv.Itoa(q.TopK)))
 	return fmt.Sprintf("%x", sum)
 }
@@ -127,7 +123,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Requests.Add(1)
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
-	var q QueryRequest
+	var q council.QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
 		respondError(w, 400, "invalid JSON query")
 		return
@@ -137,7 +133,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		respondError(w, 400, "question must contain 1–10000 characters")
 		return
 	}
-	strat, err := strategyFor(q)
+	strat, err := council.StrategyFor(q)
 	if err != nil {
 		respondError(w, 400, err.Error())
 		return
@@ -157,13 +153,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	var emit EventFn = func(string, any) {}
+	var emit council.EventFn = func(string, any) {}
 	if wantsStream {
 		stream := newEventWriter(w)
 		emit = stream.Emit
 		emit("start", map[string]string{"strategy": strat})
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), s.RequestTimeout)
 	defer cancel()
 	sources, err := s.Retrieve(ctx, q)
 	if err != nil {
@@ -281,18 +277,4 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/v1/query", s.handleQuery)
 	mux.HandleFunc("/api/v1/ingest", s.handleIngest)
 	return mux
-}
-
-func main() {
-	models := strings.Split(env("COUNCIL_MODELS", "model-a,model-b,model-c"), ",")
-	for i := range models {
-		models[i] = strings.TrimSpace(models[i])
-	}
-	c := &Council{Provider: newConfiguredModel(), Members: models, Chair: env("CHAIR_MODEL", "model-a"), Timeout: 35 * time.Second}
-	srv := NewServer(c, env("RAG_URL", "http://localhost:8000"))
-	port := env("PORT", "8080")
-	log.Printf("CouncilAI starter listening on :%s (MOCK_LLM=%s)", port, env("MOCK_LLM", "false"))
-	if err := http.ListenAndServe(":"+port, srv.Routes()); err != nil {
-		log.Fatal(err)
-	}
 }
