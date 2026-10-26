@@ -16,10 +16,28 @@ import (
 )
 
 type QueryRequest struct {
-	Question string `json:"question"`
-	DocID    string `json:"doc_id,omitempty"`
-	Strategy string `json:"strategy,omitempty"`
-	TopK     int    `json:"top_k,omitempty"`
+	Question  string `json:"question"`
+	DocID     string `json:"doc_id,omitempty"`
+	Strategy  string `json:"strategy,omitempty"`
+	TopK      int    `json:"top_k,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	// History holds earlier turns of the session, oldest first. It is set by
+	// the server from Redis, never from the request body.
+	History []ConversationTurn `json:"-"`
+}
+
+// ConversationTurn is one earlier message (reference council.ConversationTurn).
+type ConversationTurn struct {
+	Role    string `json:"role"` // "user" | "assistant"
+	Content string `json:"content"`
+}
+
+// SessionInfo reports conversation-memory handling for one request.
+type SessionInfo struct {
+	ID          string `json:"id"`
+	HistoryUsed int    `json:"history_turns_used"` // earlier turns included in the prompt
+	Saved       bool   `json:"saved"`              // this exchange was appended to the session
+	Error       string `json:"error,omitempty"`
 }
 
 // Candidate is one council member's answer. Model is the configured client's
@@ -95,8 +113,10 @@ type QueryResult struct {
 	// Cache describes cache lookups and writes for THIS request. On a hit,
 	// TokenUsage and DurationMS describe this request (no council ran);
 	// the original generation's figures are in Cache.Original*.
-	Cache      *CacheInfo `json:"cache,omitempty"`
-	DurationMS int64      `json:"duration_ms"`
+	Cache *CacheInfo `json:"cache,omitempty"`
+	// Session is set when the request belonged to a conversation session.
+	Session    *SessionInfo `json:"session,omitempty"`
+	DurationMS int64        `json:"duration_ms"`
 }
 
 // SynthesisInfo describes the chairman synthesis stage.
@@ -249,6 +269,38 @@ func ValidStrategy(s string) bool {
 	return s == "direct" || s == "council" || s == "council_deep"
 }
 
+// historyBlock renders earlier turns the way the reference flattens chat
+// messages for council members (assistant turns prefixed "Previous
+// response:"), inside a labelled section.
+func historyBlock(h []ConversationTurn) string {
+	if len(h) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, t := range h {
+		if t.Role == "assistant" {
+			parts = append(parts, "Previous response:\n"+t.Content)
+		} else {
+			parts = append(parts, "User: "+t.Content)
+		}
+	}
+	return "CONVERSATION SO FAR (earliest first; context for the new question):\n" + strings.Join(parts, "\n\n") + "\n\n"
+}
+
+// historyMessages maps earlier turns to chat messages (reference
+// buildMessages, used for direct answers).
+func historyMessages(h []ConversationTurn) []llm.Message {
+	out := make([]llm.Message, 0, len(h))
+	for _, t := range h {
+		role := "user"
+		if t.Role == "assistant" {
+			role = "assistant"
+		}
+		out = append(out, llm.Message{Role: role, Content: t.Content})
+	}
+	return out
+}
+
 func promptFor(question string, ev Evidence) string {
 	contextText := "No document context was supplied."
 	switch ev.kind() {
@@ -263,6 +315,10 @@ func promptFor(question string, ev Evidence) string {
 	return fmt.Sprintf("QUESTION:\n%s\n\nCONTEXT:\n%s\n\nAnswer accurately. When evidence is insufficient, say so; do not invent citations.", question, contextText)
 }
 
+// historyKey carries prior turns as chat messages into call(); only the
+// direct path sets it.
+type historyKey struct{}
+
 // call sends one system + user conversation with the per-stage timeout.
 // tune, if non-nil, adjusts the options (temperature, JSON mode, search).
 func (c *Council) call(ctx context.Context, client llm.LLMClient, system, user string, tune func(*llm.GenerateOptions)) (*llm.Response, error) {
@@ -273,6 +329,9 @@ func (c *Council) call(ctx context.Context, client llm.LLMClient, system, user s
 	child, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	opts := llm.GenerateOptions{Messages: []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}}}
+	if hist, ok := ctx.Value(historyKey{}).([]llm.Message); ok && len(hist) > 0 {
+		opts.Messages = append(append([]llm.Message{opts.Messages[0]}, hist...), opts.Messages[1])
+	}
 	if tune != nil {
 		tune(&opts)
 	}
@@ -342,7 +401,8 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 	}
 	prompt := promptFor(q.Question, ev)
 	if strategy == "direct" {
-		resp, err := c.call(ctx, c.Chairman, directSystem, prompt, searchFor(c.Chairman, sources))
+		dctx := context.WithValue(ctx, historyKey{}, historyMessages(q.History))
+		resp, err := c.call(dctx, c.Chairman, directSystem, prompt, searchFor(c.Chairman, sources))
 		if err != nil {
 			return result, err
 		}
@@ -360,7 +420,7 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 
 	// Stage 1: every member answers in parallel. Survivors keep configuration
 	// order and get anonymous labels A, B, C... in that order.
-	for _, cand := range c.generateCandidates(ctx, prompt, sources, emit) {
+	for _, cand := range c.generateCandidates(ctx, historyBlock(q.History)+prompt, sources, emit) {
 		addUsage(&result.TokenUsage, cand.Usage)
 		if cand.Error == "" {
 			cand.Label = labelFor(len(result.Candidates))

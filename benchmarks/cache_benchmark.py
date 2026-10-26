@@ -30,6 +30,7 @@ import re
 import statistics
 import string
 import time
+import uuid
 
 import requests
 
@@ -122,9 +123,38 @@ def cos(a, b):
     return d / math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))
 
 
+
+def authed_session(base):
+    """Register a throwaway user and return a requests.Session that sends its
+    Bearer token and waits out 429 rate-limit responses (Retry-After)."""
+    s = requests.Session()
+    name = "bench" + uuid.uuid4().hex[:12]
+    for _ in range(20):
+        r = s.post(base + "/api/v1/register", json={"username": name, "password": uuid.uuid4().hex}, timeout=15)
+        if r.status_code != 429:
+            break
+        time.sleep(int(r.headers.get("Retry-After", "5")))
+    r.raise_for_status()
+    s.headers["Authorization"] = "Bearer " + r.json()["token"]
+    plain_request = s.request
+
+    def request(method, url, **kw):
+        while True:
+            resp = plain_request(method, url, **kw)
+            if resp.status_code != 429:
+                return resp
+            time.sleep(int(resp.headers.get("Retry-After", "1")))
+
+    s.request = request
+    return s
+
+
+HTTP = None
+
+
 def ask(question, doc_id):
     t = time.perf_counter()
-    r = requests.post(f"{API}/api/v1/query", json={"question": question, "doc_id": doc_id}, timeout=120)
+    r = HTTP.post(f"{API}/api/v1/query", json={"question": question, "doc_id": doc_id}, timeout=120)
     ms = (time.perf_counter() - t) * 1000
     r.raise_for_status()
     return r.json(), ms
@@ -165,7 +195,13 @@ def main():
     report["semantic_decisions"] = sweep
     report["similarities"] = sims
 
-    # C. end-to-end through Go (one small document per pair)
+    # C. end-to-end through Go (one small document per pair). Needs the
+    # backend started with SEMANTIC_CACHE_ENABLED=true (L2 reuse is off by default).
+    global HTTP
+    HTTP = authed_session(API)
+    probe = HTTP.post(f"{API}/api/v1/query", json={"question": "semantic cache probe " + uuid.uuid4().hex}, timeout=120).json()
+    if (probe.get("cache") or {}).get("l2") == "disabled_by_policy":
+        raise SystemExit("L2 reuse is disabled on the backend; restart go-backend with SEMANTIC_CACHE_ENABLED=true for the end-to-end section")
     cold, l1, l2_hit, l2_miss = [], [], [], []
     e2e = {"paraphrase": {"hits": 0, "n": 0}, "near_miss": {"hits": 0, "n": 0}}
     calls_avoided = 0
@@ -174,7 +210,7 @@ def main():
         for label, pairs in (("paraphrase", PARAPHRASES), ("near_miss", NEAR_MISSES)):
             for i, (a, b) in enumerate(pairs):
                 body = f"Benchmark document {nonce} {label} {chr(97 + i % 26)}{i}.\n\nThis document discusses: {a} It also mentions: {b}"
-                doc = requests.post(f"{API}/api/v1/ingest", files={"file": (f"bench_{nonce}_{label}_{i}.md", body.encode())}, timeout=120).json()["doc_id"]
+                doc = HTTP.post(f"{API}/api/v1/ingest", files={"file": (f"bench_{nonce}_{label}_{i}.md", body.encode())}, timeout=120).json()["doc_id"]
                 res, ms = ask(a, doc)
                 assert not res["cache_hit"] and res["cache"]["inference_executed"], res["cache"]
                 cold.append(ms)

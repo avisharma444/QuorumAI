@@ -1,4 +1,5 @@
-"""Small Streamlit interface for the CouncilAI phase-1 vertical slice."""
+"""Streamlit interface for CouncilAI: login, conversations, documents and
+the full deliberation trace. All API calls carry the user's Bearer token."""
 import json
 import os
 
@@ -9,16 +10,94 @@ API = os.getenv("API_URL", "http://localhost:8080").rstrip("/")
 st.set_page_config(page_title="CouncilAI Starter", page_icon="🧠", layout="wide")
 st.title("🧠 CouncilAI — Deliberation Lab")
 st.caption("Phase-1 implementation: Go concurrent council + Python document retrieval. Mock mode generates illustrative, not factual, answers.")
-if "doc_id" not in st.session_state:
-    st.session_state.doc_id = ""
+for key, default in {"doc_id": "", "token": "", "username": "", "session_id": ""}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def auth_headers(extra=None):
+    """Bearer token for every protected call; the token lives only in this
+    browser session's server-side state and is never displayed or logged."""
+    h = {"Authorization": f"Bearer {st.session_state.token}"}
+    h.update(extra or {})
+    return h
+
+
+def explain(r):
+    """Turn auth/limit statuses into user-facing messages; logs out on 401."""
+    if r.status_code == 401:
+        st.session_state.token = ""
+        return "Your session expired or is invalid. Please log in again."
+    if r.status_code == 429:
+        return f"Rate limit reached. Try again in {r.headers.get('Retry-After', 'a few')} second(s)."
+    try:
+        return r.json().get("error", r.text)
+    except ValueError:
+        return r.text
+
+
+def new_session_id():
+    return "chat-" + os.urandom(6).hex()
+
+
+# ── Login / registration ─────────────────────────────────────────────
+if not st.session_state.token:
+    login_tab, register_tab = st.tabs(["Log in", "Create account"])
+    for tab, path, label in ((login_tab, "login", "Log in"), (register_tab, "register", "Create account")):
+        with tab, st.form(f"{path}_form"):
+            username = st.text_input("Username", key=f"{path}_user",
+                                     help="3–32 characters: letters, digits, '.', '_' or '-'" if path == "register" else None)
+            password = st.text_input("Password", type="password", key=f"{path}_pw",
+                                     help="8–72 characters" if path == "register" else None)
+            if st.form_submit_button(label, type="primary"):
+                try:
+                    r = requests.post(f"{API}/api/v1/{path}", json={"username": username, "password": password}, timeout=15)
+                    if r.ok:
+                        data = r.json()
+                        st.session_state.token = data["token"]
+                        st.session_state.username = data["username"]
+                        st.session_state.session_id = new_session_id()
+                        st.session_state.doc_id = ""
+                        st.rerun()
+                    else:
+                        st.error(explain(r))
+                except requests.RequestException as exc:
+                    st.error(f"Backend unavailable: {exc}")
+    st.stop()
 
 with st.sidebar:
+    st.markdown(f"Signed in as **{st.session_state.username}**")
+    if st.button("Log out"):
+        for key in ("token", "username", "session_id", "doc_id"):
+            st.session_state[key] = ""
+        st.rerun()
+    st.divider()
+    st.header("Conversation")
+    remember = st.checkbox("Remember this conversation", value=True,
+                           help="Earlier questions and answers in this session are sent to the models as context "
+                                "(kept 24 h in Redis). Follow-up answers are not cached.")
+    st.session_state.session_id = st.text_input("Session", st.session_state.session_id or new_session_id(),
+                                                max_chars=64, help="Letters, digits, '-' and '_'. Reuse an ID to continue a conversation.")
+    col_new, col_clear = st.columns(2)
+    if col_new.button("New session"):
+        st.session_state.session_id = new_session_id()
+        st.rerun()
+    if col_clear.button("Clear session"):
+        try:
+            r = requests.post(f"{API}/api/v1/conversation/clear", json={"session_id": st.session_state.session_id},
+                              headers=auth_headers(), timeout=10)
+            st.success("Session cleared.") if r.ok else st.error(explain(r))
+        except requests.RequestException as exc:
+            st.error(f"Clear failed: {exc}")
+    st.divider()
     st.header("Document")
     upload = st.file_uploader("Upload a PDF, image (OCR), TXT or Markdown file", type=["pdf", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "txt", "md"])
     if st.button("Ingest", disabled=upload is None):
         try:
-            r = requests.post(f"{API}/api/v1/ingest", files={"file": (upload.name, upload.getvalue())}, timeout=120)
-            r.raise_for_status()
+            r = requests.post(f"{API}/api/v1/ingest", files={"file": (upload.name, upload.getvalue())},
+                              headers=auth_headers(), timeout=120)
+            if not r.ok:
+                raise requests.RequestException(explain(r))
             info = r.json()
             st.session_state.doc_id = info["doc_id"]
             meta = info.get("metadata") or {}
@@ -52,21 +131,41 @@ with st.sidebar:
     streaming = st.checkbox("Show streaming stage events", value=True)
     st.caption("Model keys and providers are configured using .env, not this UI.")
 
+if remember and st.session_state.session_id:
+    try:
+        r = requests.post(f"{API}/api/v1/conversation/history", json={"session_id": st.session_state.session_id},
+                          headers=auth_headers(), timeout=10)
+        turns = r.json().get("turns") or [] if r.ok else []
+        if not r.ok:
+            st.caption(f"Conversation history unavailable: {explain(r)}")
+        if turns:
+            with st.expander(f"Conversation so far ({len(turns) // 2} exchange(s))", expanded=False):
+                for t in turns:
+                    with st.chat_message("user" if t.get("role") == "user" else "assistant"):
+                        st.write(t.get("content", ""))
+    except (requests.RequestException, ValueError) as exc:
+        st.caption(f"Conversation history unavailable: {exc}")
+
 question = st.text_area("Ask a question", "How do the alternatives compare, and what are the tradeoffs?", height=100)
 if st.button("Ask council", type="primary", disabled=not question.strip()):
     body = {"question": question, "strategy": strategy, "doc_id": st.session_state.doc_id, "top_k": 4}
+    if remember and st.session_state.session_id:
+        body["session_id"] = st.session_state.session_id
     try:
         if not streaming:
             with st.spinner("Deliberating…"):
-                r = requests.post(f"{API}/api/v1/query", json=body, timeout=150)
-                r.raise_for_status()
+                r = requests.post(f"{API}/api/v1/query", json=body, headers=auth_headers(), timeout=150)
+                if not r.ok:
+                    raise ValueError(explain(r))
                 result = r.json()
         else:
             result = None
             display = st.empty()
             events = []
-            with requests.post(f"{API}/api/v1/query", json=body, headers={"Accept": "text/event-stream"}, stream=True, timeout=150) as r:
-                r.raise_for_status()
+            with requests.post(f"{API}/api/v1/query", json=body, headers=auth_headers({"Accept": "text/event-stream"}),
+                               stream=True, timeout=150) as r:
+                if not r.ok:
+                    raise ValueError(explain(r))
                 event_type = ""
                 for line in r.iter_lines(decode_unicode=True):
                     if not line:
@@ -86,6 +185,13 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
             st.write(result.get("answer", ""))
             st.caption(f"Strategy: {result.get('strategy')} | Server latency: {result.get('duration_ms')} ms | Cache hit: {result.get('cache_hit')}")
             st.caption(f"Answer source: {result.get('source', '')} | Peer reviewed: {result.get('peer_reviewed', False)} | Top peer-ranked: {result.get('selected') or '—'}")
+            session = result.get("session")
+            if session:
+                line = f"Session {session.get('id')}: {session.get('history_turns_used', 0) // 2} earlier exchange(s) used as context"
+                line += " · saved" if session.get("saved") else " · NOT saved"
+                st.caption(line)
+                if session.get("error"):
+                    st.warning(f"Conversation memory: {session['error']}")
             cinfo = result.get("cache") or {}
             if cinfo:
                 tier = {"l1_exact": "exact (L1)", "l2_semantic": "semantic (L2)"}.get(cinfo.get("tier"), "miss")

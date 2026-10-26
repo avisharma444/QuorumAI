@@ -36,6 +36,12 @@ type Config struct {
 
 	Redis RedisConfig
 
+	Auth         AuthConfig
+	Database     DatabaseConfig
+	RateLimit    RateLimitConfig
+	Conversation ConversationConfig
+	CORSOrigins  []string // explicit browser origins; empty = CORS off
+
 	OpenRouterAPIKey string
 	OpenRouterURL    string
 	GeminiAPIKey     string
@@ -55,6 +61,49 @@ type Config struct {
 	RequestTimeout time.Duration // whole query
 }
 
+// AuthConfig holds JWT and account settings. Secrets come only from the
+// environment; validation happens at startup (auth.NewJWTManager).
+type AuthConfig struct {
+	AppEnv        string // "production" (default) or "development"
+	JWTSecret     string
+	JWTExpiration time.Duration // reference: 24h
+	BcryptCost    int
+	DemoUser      bool   // only when APP_ENV=development and AUTH_DEMO_PASSWORD is set
+	DemoPassword  string // never logged
+}
+
+// DatabaseConfig is the PostgreSQL connection (reference database section).
+type DatabaseConfig struct {
+	URL             string
+	Host            string
+	Port            string
+	User            string
+	Password        string
+	Name            string
+	SSLMode         string
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+}
+
+// RateLimitConfig: per-user API limit (reference rps/burst) and a per-IP
+// limit for register/login.
+type RateLimitConfig struct {
+	RPS           float64
+	Burst         int
+	AuthRPS       float64
+	AuthBurst     int
+	FailurePolicy string // "closed" (default) or "open" (reference)
+}
+
+// ConversationConfig: Redis conversation memory (reference: 10 turns, 24h).
+type ConversationConfig struct {
+	MaxTurns         int
+	TTL              time.Duration
+	HistoryExchanges int // earlier exchanges sent to the models (reference: 5)
+}
+
 // RedisConfig configures the Redis Stack caches (reference redis section).
 type RedisConfig struct {
 	Enabled           bool // false: no caching at all (there is no in-process fallback)
@@ -65,6 +114,7 @@ type RedisConfig struct {
 	ExactTTL          time.Duration // L1 and document summaries (reference: 1h)
 	SemanticTTL       time.Duration // L2 (reference: 24h)
 	SemanticThreshold float64       // cosine similarity (reference: 0.85)
+	SemanticReuse     bool          // L2 answer reuse; off by default (measured false positives)
 	FailureThreshold  int           // breaker: consecutive failures to open (reference: 3)
 	SuccessThreshold  int           // breaker: half-open successes to close (reference: 2)
 	BreakerTimeout    time.Duration // breaker cooldown (reference: 10s)
@@ -91,9 +141,35 @@ type yamlSchema struct {
 	Server struct {
 		Port                   string   `yaml:"port"`
 		SemanticCacheThreshold *float64 `yaml:"semantic_cache_threshold"`
+		JWTExpiration          string   `yaml:"jwt_expiration"`
+		CORSAllowedOrigins     []string `yaml:"cors_allowed_origins"`
+		RateLimit              struct {
+			RPS           float64 `yaml:"rps"`
+			Burst         int     `yaml:"burst"`
+			AuthRPS       float64 `yaml:"auth_rps"`
+			AuthBurst     int     `yaml:"auth_burst"`
+			FailurePolicy string  `yaml:"failure_policy"`
+		} `yaml:"rate_limit"`
 	} `yaml:"server"`
+	Database struct {
+		Host            string `yaml:"host"`
+		Port            string `yaml:"port"`
+		User            string `yaml:"user"`
+		DBName          string `yaml:"dbname"`
+		SSLMode         string `yaml:"sslmode"`
+		MaxOpenConns    int    `yaml:"max_open_conns"`
+		MaxIdleConns    int    `yaml:"max_idle_conns"`
+		ConnMaxLifetime string `yaml:"conn_max_lifetime"`
+		ConnMaxIdleTime string `yaml:"conn_max_idle_time"`
+	} `yaml:"database"`
+	Conversation struct {
+		MaxTurns         int    `yaml:"max_turns"`
+		TTL              string `yaml:"ttl"`
+		HistoryExchanges int    `yaml:"history_exchanges"`
+	} `yaml:"conversation"`
 	Redis struct {
 		Enabled          *bool  `yaml:"enabled"`
+		SemanticEnabled  *bool  `yaml:"semantic_cache_enabled"`
 		Addr             string `yaml:"addr"`
 		Password         string `yaml:"password"`
 		DB               int    `yaml:"db"`
@@ -263,6 +339,77 @@ func LoadFrom(path string, getenv func(string) string) (*Config, error) {
 	if r.FailureThreshold < 1 || r.SuccessThreshold < 1 {
 		l.fail("circuit breaker thresholds must be at least 1")
 	}
+	semDefault := false
+	if y.Redis.SemanticEnabled != nil {
+		semDefault = *y.Redis.SemanticEnabled
+	}
+	r.SemanticReuse = l.boolean("SEMANTIC_CACHE_ENABLED", semDefault)
+
+	a := &cfg.Auth
+	a.AppEnv = strings.ToLower(l.str("APP_ENV", "", "production"))
+	if a.AppEnv != "production" && a.AppEnv != "development" {
+		l.fail("APP_ENV must be production or development, got %q", a.AppEnv)
+	}
+	a.JWTSecret = getenv("JWT_SECRET")
+	a.JWTExpiration = l.duration("JWT_EXPIRATION", y.Server.JWTExpiration, 24*time.Hour)
+	a.BcryptCost = l.integer("BCRYPT_COST", 0, 12)
+	if a.BcryptCost < 10 || a.BcryptCost > 15 {
+		l.fail("BCRYPT_COST must be between 10 and 15")
+	}
+	a.DemoPassword = getenv("AUTH_DEMO_PASSWORD")
+	a.DemoUser = a.DemoPassword != ""
+	if a.DemoUser && a.AppEnv != "development" {
+		l.fail("AUTH_DEMO_PASSWORD is only allowed with APP_ENV=development")
+	}
+
+	d := &cfg.Database
+	d.URL = getenv("DATABASE_URL")
+	d.Host = l.str("DB_HOST", y.Database.Host, "postgres")
+	d.Port = l.str("DB_PORT", y.Database.Port, "5432")
+	d.User = l.str("DB_USER", y.Database.User, "")
+	d.Password = getenv("DB_PASSWORD")
+	d.Name = l.str("DB_NAME", y.Database.DBName, "")
+	d.SSLMode = l.str("DB_SSLMODE", y.Database.SSLMode, "disable")
+	d.MaxOpenConns = l.integer("DB_MAX_OPEN_CONNS", y.Database.MaxOpenConns, 10)
+	d.MaxIdleConns = l.integer("DB_MAX_IDLE_CONNS", y.Database.MaxIdleConns, 2)
+	d.ConnMaxLifetime = l.duration("DB_CONN_MAX_LIFETIME", y.Database.ConnMaxLifetime, time.Hour)
+	d.ConnMaxIdleTime = l.duration("DB_CONN_MAX_IDLE_TIME", y.Database.ConnMaxIdleTime, 30*time.Minute)
+
+	rl := &cfg.RateLimit
+	rl.RPS = l.float("RATE_LIMIT_RPS", y.Server.RateLimit.RPS, 10)
+	rl.Burst = l.integer("RATE_LIMIT_BURST", y.Server.RateLimit.Burst, 20)
+	rl.AuthRPS = l.float("AUTH_RATE_LIMIT_RPS", y.Server.RateLimit.AuthRPS, 0.2)
+	rl.AuthBurst = l.integer("AUTH_RATE_LIMIT_BURST", y.Server.RateLimit.AuthBurst, 10)
+	rl.FailurePolicy = strings.ToLower(l.str("RATE_LIMIT_FAILURE_POLICY", y.Server.RateLimit.FailurePolicy, "closed"))
+	if rl.RPS <= 0 || rl.Burst < 1 || rl.AuthRPS <= 0 || rl.AuthBurst < 1 {
+		l.fail("rate limits need rps > 0 and burst >= 1")
+	}
+	if rl.FailurePolicy != "closed" && rl.FailurePolicy != "open" {
+		l.fail("RATE_LIMIT_FAILURE_POLICY must be closed or open, got %q", rl.FailurePolicy)
+	}
+
+	cv := &cfg.Conversation
+	cv.MaxTurns = l.integer("CONVERSATION_MAX_TURNS", y.Conversation.MaxTurns, 10)
+	cv.TTL = l.duration("CONVERSATION_TTL", y.Conversation.TTL, 24*time.Hour)
+	cv.HistoryExchanges = l.integer("CONVERSATION_HISTORY_EXCHANGES", y.Conversation.HistoryExchanges, 5)
+	if cv.MaxTurns < 1 || cv.HistoryExchanges < 0 || cv.HistoryExchanges > cv.MaxTurns {
+		l.fail("conversation: max_turns >= 1 and 0 <= history_exchanges <= max_turns")
+	}
+
+	cfg.CORSOrigins = y.Server.CORSAllowedOrigins
+	if v := strings.TrimSpace(getenv("CORS_ALLOWED_ORIGINS")); v != "" {
+		cfg.CORSOrigins = nil
+		for _, o := range strings.Split(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				cfg.CORSOrigins = append(cfg.CORSOrigins, o)
+			}
+		}
+	}
+	for _, o := range cfg.CORSOrigins {
+		if o == "*" {
+			l.fail("CORS: wildcard origin is not allowed; list explicit origins")
+		}
+	}
 
 	for old, replacement := range legacyEnv {
 		if getenv(old) != "" {
@@ -352,6 +499,21 @@ func (l *loader) integer(key string, fromFile, def int) int {
 			return def
 		}
 		return n
+	}
+	if fromFile != 0 {
+		return fromFile
+	}
+	return def
+}
+
+func (l *loader) float(key string, fromFile, def float64) float64 {
+	if v := strings.TrimSpace(l.getenv(key)); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			l.fail("%s must be a number, got %q", key, v)
+			return def
+		}
+		return f
 	}
 	if fromFile != 0 {
 		return fromFile

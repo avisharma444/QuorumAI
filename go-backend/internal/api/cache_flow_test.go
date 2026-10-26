@@ -38,6 +38,7 @@ func semEnv(t *testing.T, replies map[string]llmtest.Reply) (*env, *cachetest.Ex
 	e := newEnv(t, replies)
 	l1, l2 := cachetest.NewExact(), cachetest.NewSemantic()
 	e.srv.Cache, e.srv.Semantic, e.srv.SemanticThreshold = l1, l2, 0.85
+	e.srv.SemanticReuse = true // controlled evaluation: L2 reuse is off by default
 	e.rag.embed = func(text string) ([]float32, string) {
 		switch {
 		case strings.Contains(text, "paraphrase"):
@@ -105,25 +106,23 @@ func TestL1HitOverSSEIsASingleFinalEvent(t *testing.T) {
 func TestL1KeyDimensions(t *testing.T) {
 	e, _, _ := semEnv(t, nil)
 	base := council.QueryRequest{Question: "What is X?", DocID: "doc-1", TopK: 4}
-	k := e.srv.l1Key(base, ModeAuto, "")
+	k := e.srv.l1Key(testUserID, base, ModeAuto, "")
 	same := base
 	same.Question, same.TopK = "  what is   x? ", 0 // normalisation and effective top_k
-	if e.srv.l1Key(same, ModeAuto, "") != k {
+	if e.srv.l1Key(testUserID, same, ModeAuto, "") != k {
 		t.Fatal("case/whitespace and default top_k must share a key")
 	}
 	other := []string{}
 	q := base
 	q.DocID = "doc-2"
-	other = append(other, e.srv.l1Key(q, ModeAuto, ""))
+	other = append(other, e.srv.l1Key(testUserID, q, ModeAuto, ""))
 	q = base
 	q.TopK = 6
-	other = append(other, e.srv.l1Key(q, ModeAuto, ""))
-	other = append(other, e.srv.l1Key(base, ModeOverride, "direct"), e.srv.l1Key(base, ModeOverride, "council"))
-	e.srv.Tenant = "org-42"
-	other = append(other, e.srv.l1Key(base, ModeAuto, ""))
-	e.srv.Tenant = ""
+	other = append(other, e.srv.l1Key(testUserID, q, ModeAuto, ""))
+	other = append(other, e.srv.l1Key(testUserID, base, ModeOverride, "direct"), e.srv.l1Key(testUserID, base, ModeOverride, "council"))
+	other = append(other, e.srv.l1Key(otherUserID, base, ModeAuto, ""))
 	e.srv.Router = agent.NewRouter(e.llm.Client("other-router"))
-	other = append(other, e.srv.l1Key(base, ModeAuto, ""))
+	other = append(other, e.srv.l1Key(testUserID, base, ModeAuto, ""))
 	seen := map[string]bool{k: true}
 	for i, o := range other {
 		if seen[o] {
@@ -131,7 +130,7 @@ func TestL1KeyDimensions(t *testing.T) {
 		}
 		seen[o] = true
 	}
-	if !strings.HasPrefix(k, "councilai:v3:l1:") {
+	if !strings.HasPrefix(k, "councilai:v4:l1:") {
 		t.Fatalf("unversioned key %s", k)
 	}
 }
@@ -311,7 +310,7 @@ func TestCacheFailuresDegradeGracefully(t *testing.T) {
 func TestCorruptL1EntryIsRecomputed(t *testing.T) {
 	e, l1, _ := semEnv(t, map[string]llmtest.Reply{"route/router": route("council", true)})
 	q := council.QueryRequest{Question: "capital corrupt", DocID: "doc-1"}
-	l1.PutRaw(e.srv.l1Key(q, ModeAuto, ""), []byte("{not json"))
+	l1.PutRaw(e.srv.l1Key(testUserID, q, ModeAuto, ""), []byte("{not json"))
 	_, res, _ := e.query(t, docQ("capital corrupt", ""))
 	if res.CacheHit || res.Cache.L1 != "corrupt_entry" || !res.Cache.InferenceExecuted {
 		t.Fatalf("%+v", res.Cache)
@@ -321,7 +320,7 @@ func TestCorruptL1EntryIsRecomputed(t *testing.T) {
 func TestSummariesLiveInTheCache(t *testing.T) {
 	e, l1, _ := semEnv(t, map[string]llmtest.Reply{"summarize/ingest": {Text: "Zogland summary."}})
 	e.ingest(t)
-	key := "councilai:v3:doc_summary:doc-1"
+	key := "councilai:v4:doc_summary:doc-1"
 	if l1.TTL(key) != time.Hour {
 		t.Fatalf("summary key/TTL: %v %s", l1.Keys(), l1.TTL(key))
 	}

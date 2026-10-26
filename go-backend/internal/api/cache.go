@@ -26,14 +26,12 @@ const (
 	// keyNamespace versions every key this service writes. Bump it when the
 	// cached response format or key layout changes, so old entries are
 	// never read with new code.
-	keyNamespace = "councilai:v3"
+	// v4: keys are scoped by authenticated user UUID; v3 ("public") entries
+	// are never read again and expire by TTL.
+	keyNamespace = "councilai:v4"
 	// promptVersion changes whenever a router, council, chairman or
 	// reflection prompt changes, invalidating answers built from old prompts.
 	promptVersion = "prompts-2026-10-cp5"
-	// DefaultTenant is the authorization namespace until authentication
-	// exists. Every key and semantic scope includes it, so per-user or
-	// per-organisation isolation only needs this value set per request.
-	DefaultTenant = "public"
 	// summaryTTL matches the reference (summaries share the L1 TTL).
 	summaryTTL = time.Hour
 )
@@ -61,26 +59,20 @@ func effectiveTopK(k int) int {
 	return k
 }
 
-func (s *Server) tenant() string {
-	if s.Tenant == "" {
-		return DefaultTenant
-	}
-	return s.Tenant
-}
-
 // l1Key is the exact-match identity of a request. It covers everything
-// known before routing that changes the answer: tenant, document, the
+// known before routing that changes the answer: the authenticated user,
+// document, the
 // normalised question, auto vs. a specific override strategy, the
 // retrieval top_k (reranking is always on), the model configuration
 // (members, chairman, router, web search) and the prompt version. The key
 // is a SHA-256 digest, so no question text or document content appears in
 // Redis key names (the reference used "cache:<doc>:<raw question>").
-func (s *Server) l1Key(q council.QueryRequest, mode, override string) string {
+func (s *Server) l1Key(userID string, q council.QueryRequest, mode, override string) string {
 	route := mode
 	if mode == ModeOverride {
 		route += ":" + override
 	}
-	return keyNamespace + ":l1:" + digest(s.tenant(), q.DocID, normalizeQuestion(q.Question), route,
+	return keyNamespace + ":l1:" + digest("user="+userID, q.DocID, normalizeQuestion(q.Question), route,
 		"top_k="+strconv.Itoa(effectiveTopK(q.TopK)), "rerank=true", s.modelFingerprint(), promptVersion)
 }
 
@@ -88,14 +80,14 @@ func (s *Server) l1Key(q council.QueryRequest, mode, override string) string {
 // of the L1 dimensions (except the question) it includes the RESOLVED
 // strategy, so a paraphrase routed differently never reuses an answer, and
 // the embedding model that produced the vector.
-func (s *Server) semanticScope(q council.QueryRequest, mode, override, strategy, embeddingModel string) cache.Scope {
+func (s *Server) semanticScope(userID string, q council.QueryRequest, mode, override, strategy, embeddingModel string) cache.Scope {
 	route := mode
 	if mode == ModeOverride {
 		route += ":" + override
 	}
 	return cache.Scope{
 		DocID: q.DocID,
-		Key: digest(s.tenant(), q.DocID, route, "strategy="+strategy, "grounding=document",
+		Key: digest("user="+userID, q.DocID, route, "strategy="+strategy, "grounding=document",
 			"top_k="+strconv.Itoa(effectiveTopK(q.TopK)), "rerank=true", s.modelFingerprint(), promptVersion, "embedding="+embeddingModel),
 	}
 }

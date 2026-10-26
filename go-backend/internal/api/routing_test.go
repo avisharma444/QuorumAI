@@ -98,6 +98,7 @@ func newEnv(t *testing.T, replies map[string]llmtest.Reply) *env {
 	f := llmtest.New(replies)
 	srv := NewServer(council.New(f.Clients("a", "b", "c"), f.Client("chair"), 2*time.Second), rag.URL)
 	srv.Cache = cachetest.NewExact()
+	withTestAuth(srv, true)
 	srv.Router = agent.NewRouter(f.Client("router"))
 	srv.IngestAgent = agent.NewIngestAgent(f.Client("ingest"))
 	return &env{srv, rag, f}
@@ -121,7 +122,7 @@ func (e *env) ingest(t *testing.T) map[string]any {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
-	e.srv.Routes().ServeHTTP(rec, req)
+	serveAuthed(e.srv, rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("ingest status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -219,7 +220,7 @@ func TestIngestRAGErrorPassesThroughWithoutSummarizing(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/ingest", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
-	e.srv.Routes().ServeHTTP(rec, req)
+	serveAuthed(e.srv, rec, req)
 	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "No readable text") || e.llm.Count("summarize") != 0 {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
@@ -350,9 +351,9 @@ func TestCacheIdentitiesAreSeparated(t *testing.T) {
 	}
 	// A different model configuration never reuses an entry.
 	q1 := council.QueryRequest{Question: "x"}
-	k1 := e.srv.l1Key(q1, ModeAuto, "")
+	k1 := e.srv.l1Key(testUserID, q1, ModeAuto, "")
 	e.srv.Router = agent.NewRouter(e.llm.Client("other-router"))
-	if e.srv.l1Key(q1, ModeAuto, "") == k1 {
+	if e.srv.l1Key(testUserID, q1, ModeAuto, "") == k1 {
 		t.Fatal("router model must be part of the cache identity")
 	}
 }
@@ -417,7 +418,7 @@ func TestCancellationDuringRoutingStopsTheRequest(t *testing.T) {
 	go func() { <-started; cancel() }()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"question":"q"}`)).WithContext(ctx)
 	rec := httptest.NewRecorder()
-	e.srv.Routes().ServeHTTP(rec, req)
+	serveAuthed(e.srv, rec, req)
 	if rec.Code != http.StatusGatewayTimeout || e.llm.Count("member")+e.llm.Count("direct") != 0 || e.rag.count("/search") != 0 {
 		t.Fatalf("%d %s calls=%v", rec.Code, rec.Body.String(), e.llm.Calls())
 	}

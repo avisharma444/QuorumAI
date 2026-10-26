@@ -203,3 +203,66 @@ func TestRedisConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthDatabaseAndLimitsFromRepositoryConfig(t *testing.T) {
+	cfg, err := LoadFrom(repoConfig, env(map[string]string{"JWT_SECRET": "from-env", "DB_PASSWORD": "pw"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, d, r, c := cfg.Auth, cfg.Database, cfg.RateLimit, cfg.Conversation
+	if a.AppEnv != "production" || a.JWTSecret != "from-env" || a.JWTExpiration != 24*time.Hour || a.BcryptCost != 12 || a.DemoUser {
+		t.Fatalf("auth %+v", a)
+	}
+	if d.Host != "postgres" || d.User != "councilai" || d.Name != "councilai" || d.Password != "pw" || d.MaxOpenConns != 10 || d.ConnMaxIdleTime != 30*time.Minute {
+		t.Fatalf("db %+v", d)
+	}
+	if r.RPS != 10 || r.Burst != 20 || r.AuthRPS != 0.2 || r.AuthBurst != 10 || r.FailurePolicy != "closed" {
+		t.Fatalf("rate %+v", r)
+	}
+	if c.MaxTurns != 10 || c.TTL != 24*time.Hour || c.HistoryExchanges != 5 {
+		t.Fatalf("conv %+v", c)
+	}
+	if cfg.Redis.SemanticReuse || len(cfg.CORSOrigins) != 0 {
+		t.Fatal("L2 reuse and CORS must be off by default")
+	}
+}
+
+func TestAuthEnvironmentOverridesAndValidation(t *testing.T) {
+	cfg, err := LoadFrom(repoConfig, env(map[string]string{
+		"SEMANTIC_CACHE_ENABLED": "true", "RATE_LIMIT_RPS": "2.5", "RATE_LIMIT_BURST": "4",
+		"RATE_LIMIT_FAILURE_POLICY": "OPEN", "CORS_ALLOWED_ORIGINS": " https://a.example , https://b.example ",
+		"APP_ENV": "development", "AUTH_DEMO_PASSWORD": "dev-only-pass", "CONVERSATION_MAX_TURNS": "3", "CONVERSATION_HISTORY_EXCHANGES": "2",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Redis.SemanticReuse || cfg.RateLimit.RPS != 2.5 || cfg.RateLimit.Burst != 4 || cfg.RateLimit.FailurePolicy != "open" {
+		t.Fatalf("%+v %+v", cfg.Redis, cfg.RateLimit)
+	}
+	if strings.Join(cfg.CORSOrigins, "|") != "https://a.example|https://b.example" || !cfg.Auth.DemoUser || cfg.Conversation.MaxTurns != 3 {
+		t.Fatalf("%v %+v", cfg.CORSOrigins, cfg.Auth.DemoUser)
+	}
+	bad := map[string]map[string]string{
+		"demo outside development": {"AUTH_DEMO_PASSWORD": "x"},
+		"unknown APP_ENV":          {"APP_ENV": "staging"},
+		"wildcard CORS":            {"CORS_ALLOWED_ORIGINS": "*"},
+		"unknown policy":           {"RATE_LIMIT_FAILURE_POLICY": "maybe"},
+		"zero rps":                 {"RATE_LIMIT_RPS": "0"},
+		"bad rps":                  {"RATE_LIMIT_RPS": "fast"},
+		"weak bcrypt":              {"BCRYPT_COST": "4"},
+		"history > turns":          {"CONVERSATION_MAX_TURNS": "2", "CONVERSATION_HISTORY_EXCHANGES": "3"},
+	}
+	for name, vars := range bad {
+		if _, err := LoadFrom(repoConfig, env(vars)); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}
+
+func TestSecretsAreNotAcceptedFromYAML(t *testing.T) {
+	for _, body := range []string{"server:\n  jwt_secret: abc\n", "database:\n  password: abc\n"} {
+		if _, err := LoadFrom(writeYAML(t, body), env(nil)); err == nil {
+			t.Fatalf("secret in YAML accepted: %q", body)
+		}
+	}
+}

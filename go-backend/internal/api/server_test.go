@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"example.com/councilai-starter/internal/auth"
+	"example.com/councilai-starter/internal/auth/authtest"
 	"example.com/councilai-starter/internal/cache/cachetest"
 	"example.com/councilai-starter/internal/council"
 	"example.com/councilai-starter/internal/llm/llmtest"
@@ -25,10 +27,47 @@ var errProvider = errors.New("provider down")
 
 // newTestServer disables web search: these tests have no RAG service, and web
 // grounding has its own tests with a fake one.
+const (
+	testUserID  = "11111111-1111-4111-8111-111111111111"
+	otherUserID = "22222222-2222-4222-8222-222222222222"
+	testSecret  = "test-jwt-secret-0123456789-abcdefghijklmnop-XYZ"
+)
+
+// withTestAuth gives a server a JWT manager and a test-only access
+// repository. Tests written before document ownership use AllowAll; the
+// ownership tests use strict grants.
+func withTestAuth(s *Server, allowAll bool) *authtest.Repo {
+	jm, err := auth.NewJWTManager(testSecret, time.Hour)
+	if err != nil {
+		panic(err)
+	}
+	repo := authtest.New()
+	repo.AllowAll = allowAll
+	s.JWT, s.Users, s.Docs, s.BcryptCost = jm, repo, repo, 4 // bcrypt.MinCost keeps tests fast
+	return repo
+}
+
+func tokenFor(s *Server, userID string) string {
+	tok, err := s.JWT.GenerateToken(userID)
+	if err != nil {
+		panic(err)
+	}
+	return tok
+}
+
+// serveAuthed serves req as testUserID unless it already carries credentials.
+func serveAuthed(s *Server, rec *httptest.ResponseRecorder, req *http.Request) {
+	if req.Header.Get("Authorization") == "" {
+		req.Header.Set("Authorization", "Bearer "+tokenFor(s, testUserID))
+	}
+	s.Routes().ServeHTTP(rec, req)
+}
+
 func newTestServer(c *council.Council, ragURL string) *Server {
 	s := NewServer(c, ragURL)
 	s.WebSearch = false
 	s.Cache = cachetest.NewExact()
+	withTestAuth(s, true)
 	return s
 }
 
@@ -41,7 +80,7 @@ func postQuery(t *testing.T, srv *Server, body string, stream bool) *httptest.Re
 		req.Header.Set("Accept", "text/event-stream")
 	}
 	rec := httptest.NewRecorder()
-	srv.Routes().ServeHTTP(rec, req)
+	serveAuthed(srv, rec, req)
 	return rec
 }
 

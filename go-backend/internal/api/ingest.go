@@ -11,6 +11,8 @@ import (
 	"net/http"
 
 	"example.com/councilai-starter/internal/agent"
+	"example.com/councilai-starter/internal/api/middleware"
+	"example.com/councilai-starter/internal/auth"
 )
 
 // Summary statuses reported in the ingestion response.
@@ -44,6 +46,11 @@ func multipartWriter(buf *bytes.Buffer, filename string, source io.Reader) strin
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		respondError(w, 405, "POST required")
+		return
+	}
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		respondError(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 12<<20)
@@ -98,6 +105,20 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	preview, _ := parsed["preview_text"].(string)
 	if docID == "" {
 		respondError(w, 502, "RAG service returned no doc_id")
+		return
+	}
+	// Record the uploader's access only after the RAG service has the
+	// document. If recording fails, no access is granted and the client is
+	// told to retry; re-uploading is idempotent (same bytes, same doc_id).
+	chunks, _ := parsed["chunk_count"].(float64)
+	method, _ := parsed["ocr_method"].(string)
+	if s.Docs == nil {
+		respondError(w, http.StatusServiceUnavailable, "document authorization unavailable")
+		return
+	}
+	if err := s.Docs.GrantDocument(r.Context(), auth.DocumentGrant{UserID: userID, DocID: docID, Filename: header.Filename, ChunkCount: int(chunks), OCRMethod: method}); err != nil {
+		log.Printf("[Ingest] access grant failed for doc %s: %v", docID, err)
+		respondError(w, http.StatusServiceUnavailable, "document was processed but access could not be recorded; please retry the upload")
 		return
 	}
 	status, summary, summaryErr := s.summarizeDocument(r.Context(), docID, preview)
