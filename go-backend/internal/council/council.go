@@ -4,7 +4,6 @@ package council
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -66,8 +65,19 @@ type QueryResult struct {
 	Selected     string      `json:"selected,omitempty"` // label of the top peer-ranked candidate
 	Candidates   []Candidate `json:"candidates,omitempty"`
 	Reviews      []Review    `json:"reviews,omitempty"`
-	Reflection   string      `json:"reflection,omitempty"`
-	Sources      []string    `json:"sources,omitempty"`
+	// Reasoning and Confidence come from the structured chairman (or
+	// revision) output that produced Answer. Confidence is the model's own
+	// claim, nil when it gave none; it is not a calibrated probability.
+	Reasoning        string          `json:"reasoning,omitempty"`
+	Confidence       *float64        `json:"confidence,omitempty"`
+	ConfidenceSource string          `json:"confidence_source,omitempty"` // "chairman" | "reflection" | "revision"
+	Synthesis        *SynthesisInfo  `json:"synthesis,omitempty"`
+	Reflection       *ReflectionInfo `json:"reflection,omitempty"`
+	// Degraded lists fallbacks or failed stages behind this answer (for
+	// example "chairman-failed-fallback", "reflection-failed"). Empty means
+	// every planned stage completed. Degraded answers are not cached.
+	Degraded []string `json:"degraded,omitempty"`
+	Sources  []string `json:"sources,omitempty"`
 	// Grounding is where Sources came from: "document", "web", or "none"
 	// (answered from model knowledge only).
 	Grounding string `json:"grounding"`
@@ -80,6 +90,37 @@ type QueryResult struct {
 	TokenUsage *llm.Usage `json:"token_usage,omitempty"`
 	CacheHit   bool       `json:"cache_hit"`
 	DurationMS int64      `json:"duration_ms"`
+}
+
+// SynthesisInfo describes the chairman synthesis stage.
+type SynthesisInfo struct {
+	Status         string `json:"status"` // "synthesized" | "failed"
+	Model          string `json:"model"`
+	ReportedSource string `json:"reported_source,omitempty"` // the model's "source" field
+	Repaired       bool   `json:"repaired,omitempty"`        // JSON needed the narrow string repair
+	Error          string `json:"error,omitempty"`
+}
+
+// ReflectionInfo is the council_deep quality audit. Faithful and Confidence
+// are the auditing model's own judgments, not independent verification.
+type ReflectionInfo struct {
+	Status     string        `json:"status"` // "completed" | "failed"
+	Model      string        `json:"model"`
+	Quality    string        `json:"quality,omitempty"`
+	Issues     string        `json:"issues,omitempty"`
+	Suggestion string        `json:"suggestion,omitempty"`
+	Faithful   *bool         `json:"faithful,omitempty"`
+	Confidence *float64      `json:"confidence,omitempty"`
+	Error      string        `json:"error,omitempty"`
+	Revision   *RevisionInfo `json:"revision,omitempty"`
+}
+
+// RevisionInfo records the single revision triggered by needs_revision.
+type RevisionInfo struct {
+	Status         string `json:"status"` // "succeeded" | "failed"
+	PreviousAnswer string `json:"previous_answer"`
+	PreviousSource string `json:"previous_source"`
+	Error          string `json:"error,omitempty"`
 }
 
 type EventFn func(string, any)
@@ -102,16 +143,9 @@ func New(members []llm.LLMClient, chairman llm.LLMClient, stageTimeout time.Dura
 const maxCandidates = 26
 
 const (
-	memberSystem     = "COUNCIL_MEMBER: independently answer using the evidence; never invent facts."
-	reviewSystem     = "REVIEW_AGENT: evaluate the anonymized answers and reply in exactly the requested format."
-	directSystem     = "DIRECT_AGENT: respond to the question using only supported evidence."
-	reflectionSystem = "REFLECTION_AGENT: critically review the answer; JSON {\"quality\":\"good|needs_revision\",\"reason\":\"...\"}."
-	reviseSystem     = "CHAIRMAN_AGENT: revise your prior answer according to critique and source evidence."
-	chairmanSystem   = `CHAIRMAN_AGENT: You are the Chairman of an AI council. Multiple AI models have independently answered a question, and their peers have reviewed and ranked the answers. Your job is to synthesize the best possible final answer.
-
-1. Consider all responses and the peer review feedback.
-2. Identify the strongest and weakest points across all answers.
-3. Synthesize a single, authoritative final answer grounded in the supplied evidence, and acknowledge uncertainty.`
+	memberSystem = "COUNCIL_MEMBER: independently answer using the evidence; never invent facts."
+	reviewSystem = "REVIEW_AGENT: evaluate the anonymized answers and reply in exactly the requested format."
+	directSystem = "DIRECT_AGENT: respond to the question using only supported evidence."
 )
 
 // Evidence kinds.
@@ -252,6 +286,7 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 	fallback := func(cand Candidate, source, reason string) (QueryResult, error) {
 		result.Answer = cand.Answer
 		result.Source = cand.Model + " (" + source + ")"
+		result.Degraded = append(result.Degraded, source)
 		emit("fallback", map[string]string{"reason": reason, "source": result.Source})
 		return finish()
 	}
@@ -315,27 +350,29 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 	result.Selected = best.Label
 	result.PeerReviewed = true
 
-	// Stage 3: the chairman synthesizes from candidates plus valid reviews.
-	resp, err := c.call(ctx, c.Chairman, chairmanSystem, chairmanPrompt(prompt, result.Candidates, result.Reviews), nil)
-	if err == nil {
-		addUsage(&result.TokenUsage, reported(resp))
-		if strings.TrimSpace(resp.Answer) == "" {
-			err = errors.New("empty chairman response")
-		}
-	}
+	// Stage 3: structured chairman synthesis from candidates plus valid reviews.
+	chairModel := c.Chairman.ModelName()
+	cr, usage, err := c.chairmanSynthesize(ctx, q.Question, ev, result.Candidates, result.Reviews)
+	addUsage(&result.TokenUsage, usage)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, ctxErr
 		}
-		return fallback(best, "chairman-failed-fallback", "chairman unavailable; returning the top peer-ranked candidate")
+		result.Synthesis = &SynthesisInfo{Status: "failed", Model: chairModel, Error: err.Error()}
+		emit("synthesis", *result.Synthesis)
+		return fallback(best, "chairman-failed-fallback", "chairman unavailable or invalid; returning the top peer-ranked candidate")
 	}
-	result.Answer = resp.Answer
-	result.Source = "chairman:" + c.Chairman.ModelName()
+	result.applyChairman(cr, "chairman")
+	result.Source = "chairman:" + chairModel
+	result.Synthesis = &SynthesisInfo{Status: "synthesized", Model: chairModel, ReportedSource: cr.Source, Repaired: cr.Repaired}
+	emit("synthesis", map[string]any{"status": "synthesized", "model": chairModel, "confidence": result.Confidence})
 
 	// Stage 4 (council_deep only): reflect on, and possibly revise, the
 	// chairman's answer. Fallback answers above never reach this point.
 	if strategy == "council_deep" {
-		c.reflect(ctx, prompt, &result, emit)
+		if err := c.deepReflection(ctx, q.Question, ev, &result, emit); err != nil {
+			return result, err
+		}
 	}
 	return finish()
 }
@@ -400,35 +437,72 @@ func (c *Council) peerReview(ctx context.Context, question string, cands []Candi
 	return reviews
 }
 
-// reflect uses the chairman client with the reference's reflection
-// settings: low temperature, JSON output, at most 500 tokens.
-func (c *Council) reflect(ctx context.Context, prompt string, result *QueryResult, emit EventFn) {
-	resp, err := c.call(ctx, c.Chairman, reflectionSystem, prompt+"\n\nPROPOSED ANSWER:\n"+result.Answer, func(o *llm.GenerateOptions) {
-		o.Temperature, o.ResponseJSON, o.MaxTokens = llm.Float64Ptr(0.2), true, 500
-	})
+// applyChairman makes a validated chairman (or revision) result the answer.
+// A missing confidence clears any earlier one: it described another answer.
+func (r *QueryResult) applyChairman(cr *ChairmanResult, confidenceSource string) {
+	r.Answer, r.Reasoning = cr.Answer, cr.Reasoning
+	r.Confidence, r.ConfidenceSource = nil, ""
+	if cr.ConfidenceReported {
+		v := cr.Confidence
+		r.Confidence, r.ConfidenceSource = &v, confidenceSource
+	}
+}
+
+// deepReflection runs the reference's reflection loop: one audit and, only
+// when the audit says "needs_revision", exactly one revision. Invalid or
+// failed steps keep the current answer and are recorded; only cancellation
+// is returned as an error.
+func (c *Council) deepReflection(ctx context.Context, question string, ev Evidence, result *QueryResult, emit EventFn) error {
+	model := c.Chairman.ModelName()
+	info := &ReflectionInfo{Model: model}
+	result.Reflection = info
+	r, usage, err := c.reflectOn(ctx, question, ev, result.Answer)
+	addUsage(&result.TokenUsage, usage)
 	if err != nil {
-		return
-	}
-	addUsage(&result.TokenUsage, reported(resp))
-	var reflection struct {
-		Quality string `json:"quality"`
-		Reason  string `json:"reason"`
-	}
-	if json.Unmarshal([]byte(extractJSONObject(resp.Answer)), &reflection) != nil {
-		return
-	}
-	result.Reflection = reflection.Quality + ": " + reflection.Reason
-	emit("reflection", reflection)
-	if reflection.Quality == "needs_revision" {
-		revised, err := c.call(ctx, c.Chairman, reviseSystem, prompt+"\nPrior: "+result.Answer+"\nCritique: "+reflection.Reason, nil)
-		if err == nil {
-			addUsage(&result.TokenUsage, reported(revised))
-			if strings.TrimSpace(revised.Answer) != "" {
-				result.Answer = revised.Answer
-				result.Source = "chairman-revised:" + c.Chairman.ModelName()
-			}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
+		info.Status, info.Error = "failed", err.Error()
+		result.Degraded = append(result.Degraded, "reflection-failed")
+		emit("reflection", *info)
+		return nil
 	}
+	faithful := r.Faithful
+	info.Status, info.Quality, info.Issues, info.Suggestion, info.Faithful = "completed", r.Quality, r.Issues, r.Suggestion, &faithful
+	if r.ConfidenceReported {
+		v := r.Confidence
+		info.Confidence = &v
+	}
+	emit("reflection", *info)
+
+	// The reference revises only on quality == "needs_revision"; a "good"
+	// audit with faithful=false is reported but does not trigger revision.
+	if r.Quality != "needs_revision" {
+		// Reference behaviour: a good audit's confidence becomes the answer's.
+		if info.Confidence != nil {
+			v := *info.Confidence
+			result.Confidence, result.ConfidenceSource = &v, "reflection"
+		}
+		return nil
+	}
+	rev := &RevisionInfo{PreviousAnswer: result.Answer, PreviousSource: result.Source}
+	info.Revision = rev
+	revised, usage, err := c.reviseAnswer(ctx, question, ev, result.Answer, *r)
+	addUsage(&result.TokenUsage, usage)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		rev.Status, rev.Error = "failed", err.Error()
+		result.Degraded = append(result.Degraded, "revision-failed")
+		emit("revision", *rev)
+		return nil
+	}
+	result.applyChairman(revised, "revision")
+	result.Source = "chairman-revised:" + model
+	rev.Status = "succeeded"
+	emit("revision", *rev)
+	return nil
 }
 
 // ── Prompts ─────────────────────────────────────────────────────────
@@ -462,18 +536,6 @@ Your task:
 Format your response as:
 RANKING: [best to worst, e.g., "B, A, C"]
 REASONING: [1-2 sentence explanation of your ranking]`, question, anonymizedBlock(cands))
-}
-
-// chairmanPrompt passes only valid reviews: an unparseable review carries no
-// trustworthy ranking and would mislead the synthesis.
-func chairmanPrompt(prompt string, cands []Candidate, reviews []Review) string {
-	var reviewParts []string
-	for _, r := range reviews {
-		if r.Error == "" {
-			reviewParts = append(reviewParts, fmt.Sprintf("--- Reviewer %d ---\n%s", r.Index+1, r.Raw))
-		}
-	}
-	return prompt + "\n\nINDIVIDUAL RESPONSES:\n" + anonymizedBlock(cands) + "\n\nPEER REVIEWS:\n" + strings.Join(reviewParts, "\n\n")
 }
 
 // ── Ranking parsing and selection ───────────────────────────────────
@@ -595,15 +657,6 @@ func pickLongest(cands []Candidate) int {
 		}
 	}
 	return best
-}
-
-func extractJSONObject(raw string) string {
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start < 0 || end < start {
-		return raw
-	}
-	return raw[start : end+1]
 }
 
 // Keep source ordering stable when testing/fingerprinting a result.

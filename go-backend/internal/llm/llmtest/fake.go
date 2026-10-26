@@ -9,14 +9,19 @@ import (
 	"example.com/councilai-starter/internal/llm"
 )
 
-// StageOf maps a system prompt to the council stage that sent it.
-func StageOf(system string) string {
+// StageOf maps a system prompt to the council stage that sent it. Revision
+// reuses the chairman prompt (as in the reference), so use StageOfMessages
+// when the user message is available.
+func StageOf(system string) string { return StageOfMessages(system, "") }
+
+// StageOfMessages identifies the stage from the system and user messages.
+func StageOfMessages(system, user string) string {
 	switch {
-	case strings.HasPrefix(system, "REFLECTION_AGENT"):
+	case strings.HasPrefix(system, "You are a quality assurance agent"):
 		return "reflect"
-	case strings.HasPrefix(system, "CHAIRMAN_AGENT: revise"):
+	case strings.HasPrefix(system, "You are the Chairman of an AI council") && strings.Contains(user, "Quality review feedback:"):
 		return "revise"
-	case strings.HasPrefix(system, "CHAIRMAN_AGENT"):
+	case strings.HasPrefix(system, "You are the Chairman of an AI council"):
 		return "chair"
 	case strings.HasPrefix(system, "REVIEW_AGENT"):
 		return "review"
@@ -125,7 +130,7 @@ func (c *client) GenerateChat(ctx context.Context, opts llm.GenerateOptions) (*l
 			user = append(user, m.Content)
 		}
 	}
-	stage := StageOf(strings.Join(system, "\n"))
+	stage := StageOfMessages(strings.Join(system, "\n"), strings.Join(user, "\n"))
 	key := stage + "/" + c.name
 	c.f.mu.Lock()
 	c.f.calls[stage]++

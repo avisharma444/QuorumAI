@@ -93,7 +93,7 @@ func TestSSEEventOrder(t *testing.T) {
 	for _, e := range events {
 		names = append(names, e.name)
 	}
-	want := []string{"start", "routing", "retrieved", "candidate", "candidate", "candidate", "review", "review", "review", "final"}
+	want := []string{"start", "routing", "retrieved", "candidate", "candidate", "candidate", "review", "review", "review", "synthesis", "final"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("got events %v, want %v", names, want)
 	}

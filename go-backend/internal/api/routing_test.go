@@ -239,7 +239,7 @@ func TestNoDocumentSimpleQuestionDirectWithWebGrounding(t *testing.T) {
 func TestNoDocumentComplexQuestionDeepCouncil(t *testing.T) {
 	e := newEnv(t, map[string]llmtest.Reply{"route/router": route("council_deep", false)})
 	_, res, _ := e.query(t, `{"question":"Should a hospital adopt AI triage?"}`)
-	if res.Strategy != "council_deep" || len(res.Candidates) != 3 || len(res.Reviews) != 3 || res.Reflection == "" || e.llm.Count("reflect") != 1 {
+	if res.Strategy != "council_deep" || len(res.Candidates) != 3 || len(res.Reviews) != 3 || res.Reflection == nil || res.Reflection.Status != "completed" || e.llm.Count("reflect") != 1 {
 		t.Fatalf("%+v", res)
 	}
 }

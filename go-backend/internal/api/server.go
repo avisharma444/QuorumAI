@@ -297,9 +297,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decorate(&result)
-	// Degraded routing or grounding is not cached, so a later request can
-	// get the properly routed, grounded answer.
-	if !info.Fallback && info.GroundingError == "" {
+	// Only fully completed executions are cached. Degraded routing,
+	// grounding, or council stages (fallback answers, failed reflection or
+	// revision) are not, so a later request can get the complete answer.
+	if !info.Fallback && info.GroundingError == "" && len(result.Degraded) == 0 {
 		s.Cache.Set(key, result)
 	}
 	if !wantsStream {

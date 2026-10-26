@@ -99,7 +99,22 @@ diagnostic override that skips the router.
   document's summary is missing, the document is still used.
 - Mock mode (`MOCK_LLM=true`) routes with explicit markers in the question:
   `#route=direct|council|council_deep|invalid` and `#needs_doc=true|false`.
-  Without markers the mock router picks `council`.
+  Without markers the mock router picks `council`. Chairman and self-review
+  paths can be scripted the same way: `#chair=invalid` (chairman fallback),
+  `#reflect=needs_revision` (one revision), `#reflect=invalid`,
+  `#revise=invalid`. Mock models never report confidence.
+
+### Chairman synthesis and self-review
+
+In `council` and `council_deep` the chairman returns validated JSON
+(`answer`, `reasoning`, optional `source` and `confidence`). Invalid output
+counts as a chairman failure: the top peer-ranked candidate is returned and
+`degraded` says so. `council_deep` then runs one quality audit
+(`quality`, `issues`, `suggestion`, `faithful`) and, only on
+`needs_revision`, exactly one revision; failures keep the current answer and
+are reported, never turned into a "good" audit. `confidence` is the model's
+self-report (absent if it gave none), not a calibrated probability. Only
+answers where every stage completed are cached.
 
 ### Use real model providers
 

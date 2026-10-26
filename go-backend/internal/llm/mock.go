@@ -12,9 +12,10 @@ import (
 // MOCK_LLM=true is set explicitly, and by tests. It never touches the network
 // and is never used as a fallback for a failing real provider.
 //
-// It picks a reply from the stage tag at the start of the system message
-// (COUNCIL_MEMBER, REVIEW_AGENT, CHAIRMAN_AGENT, REFLECTION_AGENT). It
-// reports no token usage, so none is invented.
+// It picks a reply from the system message (our stage tags COUNCIL_MEMBER,
+// REVIEW_AGENT, DIRECT_AGENT, or the reference router, summarizer, chairman
+// and reflection prompts). It reports no token usage and no confidence, so
+// none is invented.
 type MockClient struct {
 	Name  string
 	Delay time.Duration
@@ -82,6 +83,25 @@ func mockRoute(prompt string) string {
 	return fmt.Sprintf(`{"strategy":%q,"reasoning":%q,"needs_doc":%t}`, strategy, reasoning, needsDoc)
 }
 
+// Mock reflection directives (mock mode only), written in the question:
+//
+//	#reflect=needs_revision   audit asks for one revision
+//	#reflect=invalid          malformed audit (exercises reflection failure)
+//	#revise=invalid           malformed revision (exercises revision failure)
+//	#chair=invalid            malformed chairman output (exercises the fallback)
+//
+// Without directives the mock audit returns "good". It never reports a
+// confidence value.
+func mockReflection(prompt string) string {
+	switch {
+	case strings.Contains(prompt, "#reflect=invalid"):
+		return `{"quality":"excellent"}`
+	case strings.Contains(prompt, "#reflect=needs_revision"):
+		return `{"quality":"needs_revision","issues":"Mock audit: placeholder issue.","suggestion":"Mock audit: placeholder suggestion.","faithful":false}`
+	}
+	return `{"quality":"good","issues":"","suggestion":"","faithful":true}`
+}
+
 func mockAnswer(model, system, prompt string) string {
 	switch {
 	case strings.Contains(system, "query classifier for a multi-LLM council"):
@@ -101,10 +121,18 @@ func mockAnswer(model, system, prompt string) string {
 			ranking[i] = m[1]
 		}
 		return "RANKING: " + strings.Join(ranking, ", ") + "\nREASONING: Mock reviewer; deterministic order, not a quality judgment."
-	case strings.Contains(system, "REFLECTION_AGENT"):
-		return `{"quality":"good","reason":"mock validation only"}`
-	case strings.Contains(system, "CHAIRMAN_AGENT"):
-		return "[MOCK consensus] Representative council synthesis. Configure real providers to generate meaningful answers."
+	case strings.Contains(system, "quality assurance agent"):
+		return mockReflection(prompt)
+	case strings.Contains(system, "Chairman of an AI council") && strings.Contains(prompt, "Quality review feedback:"):
+		if strings.Contains(prompt, "#revise=invalid") {
+			return "Here is my improved answer, without JSON."
+		}
+		return `{"answer":"[MOCK revised] Representative revised synthesis addressing the review feedback.","reasoning":"Mock revision; not a real model judgment.","source":"chairman-synthesis"}`
+	case strings.Contains(system, "Chairman of an AI council"):
+		if strings.Contains(prompt, "#chair=invalid") {
+			return `{"answer": "unterminated`
+		}
+		return `{"answer":"[MOCK consensus] Representative council synthesis. Configure real providers to generate meaningful answers.","reasoning":"Mock synthesis; not a real model judgment.","source":"chairman-synthesis"}`
 	default:
 		short := prompt
 		if len(short) > 180 {

@@ -98,6 +98,45 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
             usage = result.get("token_usage")
             st.caption(f"Token usage (provider-reported): {usage['total_tokens']} total" if usage else "Token usage: not reported by the providers")
             st.caption(result.get("confidence_note", ""))
+            for stage in result.get("degraded") or []:
+                st.warning(f"Degraded: {stage.replace('-', ' ')}")
+            synthesis = result.get("synthesis")
+            reflection = result.get("reflection")
+            if synthesis or reflection:
+                with st.expander("Chairman synthesis and self-review", expanded=True):
+                    st.caption("Everything here is the models' own assessment, not an independent evaluation. "
+                               "A self-reported confidence of 0.9 does not mean 90% of such answers are correct.")
+                    if synthesis:
+                        if synthesis.get("status") == "synthesized":
+                            st.markdown(f"**Synthesized by** `{synthesis.get('model')}`")
+                        else:
+                            st.error(f"Chairman synthesis failed; showing the top peer-ranked candidate instead. {synthesis.get('error', '')}")
+                    if result.get("reasoning"):
+                        st.markdown(f"**Synthesis rationale:** {result['reasoning']}")
+                    conf = result.get("confidence")
+                    if conf is not None:
+                        st.markdown(f"**Model self-reported confidence:** {conf:.2f} (from {result.get('confidence_source', 'model')})")
+                    else:
+                        st.caption("No confidence was reported by the model.")
+                    if reflection:
+                        if reflection.get("status") != "completed":
+                            st.warning(f"Self-review unavailable: {reflection.get('error', '')}. This is not evidence the answer is faithful.")
+                        else:
+                            faithful = reflection.get("faithful")
+                            st.markdown(f"**Self-review quality:** {reflection.get('quality')} · **faithful to sources (model's view):** {faithful}")
+                            if reflection.get("issues"):
+                                st.markdown(f"**Issues:** {reflection['issues']}")
+                            if reflection.get("suggestion"):
+                                st.markdown(f"**Suggestion:** {reflection['suggestion']}")
+                        revision = reflection.get("revision")
+                        if revision:
+                            if revision.get("status") == "succeeded":
+                                st.success("Answer revised once after self-review.")
+                            else:
+                                st.warning(f"Revision failed; the original synthesized answer is kept. {revision.get('error', '')}")
+                            with st.expander("Answer before revision"):
+                                st.caption(f"Source: {revision.get('previous_source')}")
+                                st.write(revision.get("previous_answer", ""))
             with st.expander("Candidate responses"):
                 for c in result.get("candidates", []):
                     label = f"Response {c['label']} — " if c.get("label") else ""
@@ -126,7 +165,7 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
                         }
                         for r in reviews
                     ])
-                st.json({"reviews": reviews, "evidence": result.get("sources", []), "reflection": result.get("reflection", "")})
+                st.json({"reviews": reviews, "evidence": result.get("sources", []), "synthesis": result.get("synthesis"), "reflection": result.get("reflection")})
     except (requests.RequestException, ValueError) as exc:
         st.error(f"Request failed: {exc}")
 

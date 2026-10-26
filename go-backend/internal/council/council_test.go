@@ -3,6 +3,7 @@ package council
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -57,6 +58,11 @@ func mustRun(t *testing.T, m *llmtest.Fake, strategy string) (QueryResult, *even
 		t.Fatalf("Run failed: %v", err)
 	}
 	return res, log
+}
+
+// chairJSON is a valid structured chairman reply.
+func chairJSON(answer string) llmtest.Reply {
+	return llmtest.Reply{Text: fmt.Sprintf(`{"answer":%q,"reasoning":"synthesized","source":"chairman-synthesis"}`, answer)}
 }
 
 func ranking(r string) llmtest.Reply {
@@ -203,7 +209,7 @@ func TestNonFirstCandidateWinsByWeightedRanking(t *testing.T) {
 		"review/a":    ranking("B, A, C"),
 		"review/b":    ranking("B, C, A"),
 		"review/c":    ranking("A, B, C"),
-		"chair/chair": {Text: "chairman synthesis"},
+		"chair/chair": chairJSON("chairman synthesis"),
 	})
 	res, _ := mustRun(t, f, "council")
 	if res.Selected != "B" || res.Answer != "chairman synthesis" || res.Source != "chairman:chair" || !res.PeerReviewed {
@@ -528,7 +534,7 @@ func TestChairmanFailureReturnsTopRankedNotFirst(t *testing.T) {
 			if res.Answer != "c's answer" || res.Source != "c (chairman-failed-fallback)" || res.Selected != "C" || !res.PeerReviewed {
 				t.Fatalf("unexpected: %+v", res)
 			}
-			if f.Count("reflect") != 0 || res.Reflection != "" {
+			if f.Count("reflect") != 0 || res.Reflection != nil {
 				t.Fatal("reflection must not run on a fallback answer")
 			}
 			if !log.has("fallback") {
@@ -540,15 +546,18 @@ func TestChairmanFailureReturnsTopRankedNotFirst(t *testing.T) {
 
 func TestDeepReflectionRevisesAfterChairman(t *testing.T) {
 	f := llmtest.New(map[string]llmtest.Reply{
-		"chair/chair":   {Text: "draft"},
-		"reflect/chair": {Text: `{"quality":"needs_revision","reason":"missing Y"}`},
-		"revise/chair":  {Text: "revised answer"},
+		"chair/chair":   chairJSON("draft"),
+		"reflect/chair": {Text: `{"quality":"needs_revision","issues":"missing Y","suggestion":"add Y","faithful":true}`},
+		"revise/chair":  {Text: `{"answer":"revised answer","reasoning":"added Y","source":"chairman-synthesis"}`},
 	})
 	res, log := mustRun(t, f, "council_deep")
-	if res.Answer != "revised answer" || res.Reflection != "needs_revision: missing Y" || res.Source != "chairman-revised:chair" {
+	if res.Answer != "revised answer" || res.Reasoning != "added Y" || res.Source != "chairman-revised:chair" {
 		t.Fatalf("unexpected: %+v", res)
 	}
-	if !log.has("reflection") {
+	if r := res.Reflection; r.Status != "completed" || r.Quality != "needs_revision" || r.Issues != "missing Y" || r.Revision.Status != "succeeded" || r.Revision.PreviousAnswer != "draft" {
+		t.Fatalf("reflection %+v", r)
+	}
+	if !log.has("reflection") || !log.has("revision") {
 		t.Fatalf("events %v", log.names)
 	}
 	// Plain council mode never reflects.
@@ -598,14 +607,12 @@ func TestEvidenceIsLabelledByKind(t *testing.T) {
 		if res.Grounding != tc.grounding {
 			t.Fatalf("grounding %q, want %q", res.Grounding, tc.grounding)
 		}
-		for _, stage := range []string{"member", "chair"} {
-			model := "a"
-			if stage == "chair" {
-				model = "chair"
-			}
-			if p := f.Prompt(stage, model); !strings.Contains(p, tc.label) {
-				t.Fatalf("%s prompt missing %q:\n%s", stage, tc.label, p)
-			}
+		if p := f.Prompt("member", "a"); !strings.Contains(p, tc.label) {
+			t.Fatalf("member prompt missing %q:\n%s", tc.label, p)
+		}
+		chairLabel := map[string]string{"none": "", "document": "Document Excerpts:", "web": "Web Search Results (unverified third-party pages"}[tc.grounding]
+		if p := f.Prompt("chair", "chair"); !strings.Contains(p, chairLabel) || (tc.grounding != "document" && strings.Contains(p, "Document Excerpts:")) {
+			t.Fatalf("chairman prompt for %s:\n%s", tc.grounding, p)
 		}
 		if tc.grounding == "web" && strings.Contains(f.Prompt("member", "a"), "Document excerpts") {
 			t.Fatal("web results must not be presented as document excerpts")

@@ -130,7 +130,7 @@ func TestMixedProviderCouncilEndToEnd(t *testing.T) {
 		replies{"member": "OpenRouter answer", "review": "RANKING: B, C, A\nREASONING: B cites more."},
 		replies{"member": "Gemini answer", "review": "RANKING: B, A, C\nREASONING: B is complete."},
 		replies{"member": "NIM answer", "review": "RANKING: C, B, A\nREASONING: C is concise."},
-		replies{"chair": "Chairman synthesis"},
+		replies{"chair": `{"answer":"Chairman synthesis","reasoning":"B was strongest","source":"chairman-synthesis","confidence":0.8}`},
 	)
 	log := &eventLog{}
 	res, err := c.Run(context.Background(), QueryRequest{Question: "Compare X and Y", Strategy: "council"}, Evidence{}, log.emit)
@@ -216,7 +216,7 @@ func TestMixedProviderPartialFailure(t *testing.T) {
 		t.Fatalf("candidates %+v", res.Candidates)
 	}
 	// NIM's answer failed but it still reviewed; B = 2+2+1 = 5 beats A = 4.
-	if res.Selected != "B" || res.Answer != "Gemini answer" || res.Source != "gemini:gemini-test (chairman-failed-fallback)" || res.Reflection != "" {
+	if res.Selected != "B" || res.Answer != "Gemini answer" || res.Source != "gemini:gemini-test (chairman-failed-fallback)" || res.Reflection != nil {
 		t.Fatalf("result %+v", res)
 	}
 	if res.TokenUsage.TotalTokens != 15*5 { // 2 candidates + 3 reviews; failed calls report nothing
@@ -226,7 +226,7 @@ func TestMixedProviderPartialFailure(t *testing.T) {
 
 func TestDirectAndDeepWithGeminiChairman(t *testing.T) {
 	chair := newStageServer(t, true, script(replies{
-		"direct": "direct answer", "chair": "draft", "reflect": `{"quality":"good","reason":"grounded"}`,
+		"direct": "direct answer", "chair": `{"answer":"draft","reasoning":"r","source":"chairman-synthesis"}`, "reflect": `{"quality":"good","issues":"","suggestion":"","faithful":true}`,
 	}))
 	chairman := llm.NewGeminiClientWithURL(fakeKey, chair.URL, "gemini-chair", 5*time.Second)
 	f := llmtest.New(nil)
@@ -250,7 +250,7 @@ func TestDirectAndDeepWithGeminiChairman(t *testing.T) {
 	}
 
 	res, err = c.Run(context.Background(), QueryRequest{Question: "Compare", Strategy: "council_deep"}, Evidence{}, nil)
-	if err != nil || res.Answer != "draft" || res.Reflection != "good: grounded" {
+	if err != nil || res.Answer != "draft" || res.Reflection == nil || res.Reflection.Quality != "good" || !*res.Reflection.Faithful {
 		t.Fatalf("deep: %+v %v", res, err)
 	}
 	gen, _ := chair.body("reflect")["generationConfig"].(map[string]any)
