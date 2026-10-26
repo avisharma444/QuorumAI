@@ -1,7 +1,9 @@
-"""Document processing and zero-API-cost retrieval core.
+"""BENCHMARK BASELINE ONLY — not used by the service.
 
-Default: hashed lexical vectors (lightweight baseline, NOT semantic embeddings).
-Set EMBEDDING_BACKEND=sentence-transformer to use all-MiniLM-L6-v2 (384-dim).
+This is the starter's original retrieval: fixed-size character windows,
+hashed bag-of-words vectors and SQLite. It is kept solely so the retrieval
+evaluation (benchmarks/rag_eval.py) can compare it with the neural pipeline,
+and so its original tests keep running. app.main never imports it.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .sampling import bme_preview
+from ..sampling import bme_preview
 
 VECTOR_DIM = 384
 

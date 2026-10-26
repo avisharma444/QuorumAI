@@ -1,8 +1,26 @@
+# CouncilAI RAG service. torch is installed first from the CPU-only index
+# (see Dockerfile) so no CUDA wheels are pulled; works on ARM64 (Apple M-series).
 fastapi>=0.110,<1
 uvicorn[standard]>=0.27,<1
-pypdf>=5,<7
 python-multipart>=0.0.12,<1
-# Web search grounding (reference: duckduckgo-search + BeautifulSoup + requests)
+pyyaml>=6,<7
+
+# Document inspection and extraction (reference libraries)
+PyPDF2==3.0.1
+pdfplumber==0.11.4
+pytesseract==0.3.13
+pdf2image==1.17.0
+Pillow>=10.1,<12
+
+# Neural retrieval (reference libraries)
+transformers==4.46.3
+sentence-transformers==3.3.1
+chromadb==0.5.23
+# chromadb 0.5.x calls posthog.capture() with the pre-v4 signature (telemetry is disabled anyway)
+posthog>=2.4,<4
+numpy>=1.26,<2
+
+# Web search grounding (checkpoint 4)
 duckduckgo-search>=6.1.7,<9
 beautifulsoup4>=4.12,<5
 requests>=2.31,<3

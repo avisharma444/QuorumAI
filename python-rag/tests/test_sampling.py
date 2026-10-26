@@ -1,6 +1,6 @@
 import pytest
 
-from app.core import DocumentStore, Embedder
+from app.baselines.hash_retrieval import DocumentStore, Embedder
 from app.sampling import PREVIEW_CHAR_LIMIT, bme_indices, bme_preview
 
 

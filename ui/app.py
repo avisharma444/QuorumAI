@@ -14,14 +14,22 @@ if "doc_id" not in st.session_state:
 
 with st.sidebar:
     st.header("Document")
-    upload = st.file_uploader("Upload a PDF, TXT or Markdown file", type=["pdf", "txt", "md"])
+    upload = st.file_uploader("Upload a PDF, image (OCR), TXT or Markdown file", type=["pdf", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "txt", "md"])
     if st.button("Ingest", disabled=upload is None):
         try:
             r = requests.post(f"{API}/api/v1/ingest", files={"file": (upload.name, upload.getvalue())}, timeout=120)
             r.raise_for_status()
             info = r.json()
             st.session_state.doc_id = info["doc_id"]
-            st.success(f"Indexed {info['chunks']} chunks on {info['pages']} pages")
+            meta = info.get("metadata") or {}
+            st.success(f"Indexed {info.get('chunk_count')} chunks from {meta.get('page_count', '?')} page(s)"
+                       + (" (replaced the earlier copy of this file)" if info.get("replaced") else ""))
+            st.caption(f"Extraction: {info.get('ocr_method')} · type {meta.get('file_type')} · text layer {meta.get('has_text_layer')} · "
+                       f"scanned {meta.get('is_scanned')} · tables {meta.get('has_tables')}")
+            if info.get("chunk_types"):
+                st.caption("Chunk types: " + ", ".join(f"{k} × {v}" for k, v in sorted(info["chunk_types"].items())))
+            if info.get("embedding_model"):
+                st.caption(f"Embedding model: {info['embedding_model']}")
             status = info.get("summary_status", "unknown")
             if info.get("summary"):
                 st.caption(f"Document summary ({info.get('summary_model', 'ingestion model')}):")
@@ -137,6 +145,33 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
                             with st.expander("Answer before revision"):
                                 st.caption(f"Source: {revision.get('previous_source')}")
                                 st.write(revision.get("previous_answer", ""))
+            retrieval = result.get("retrieval")
+            if retrieval:
+                with st.expander(f"Retrieved document chunks ({len(retrieval.get('chunks') or [])})"):
+                    if retrieval.get("reranked"):
+                        st.caption(f"Ordered by cross-encoder score (raw logits, higher = more relevant; not probabilities) from {retrieval.get('candidates')} vector candidates.")
+                    else:
+                        st.caption(f"Vector order ({retrieval.get('distance_metric')} distance, lower = closer)."
+                                   + (f" Reranking unavailable: {retrieval['rerank_error']}" if retrieval.get("rerank_error") else ""))
+                    for ch in retrieval.get("chunks") or []:
+                        where = []
+                        if ch.get("page_number"):
+                            where.append(f"page {ch['page_number']}" + (f"–{ch['page_end']}" if ch.get("page_end") else ""))
+                        where.append(ch.get("chunk_type", ""))
+                        if ch.get("ocr_method"):
+                            where.append(ch["ocr_method"])
+                        scores = []
+                        if ch.get("rerank_score") is not None:
+                            scores.append(f"rerank {ch['rerank_score']:.2f}")
+                        if ch.get("vector_distance") is not None:
+                            scores.append(f"distance {ch['vector_distance']:.2f}")
+                        if ch.get("ocr_confidence") is not None:
+                            scores.append(f"OCR confidence {ch['ocr_confidence']:.2f}")
+                        st.markdown(f"**Chunk {ch.get('chunk_index')}** · {' · '.join(where)} · {' · '.join(scores)}")
+                        if ch.get("chunk_type") == "table":
+                            st.markdown(ch.get("content", ""))
+                        else:
+                            st.text(ch.get("content", ""))
             with st.expander("Candidate responses"):
                 for c in result.get("candidates", []):
                     label = f"Response {c['label']} — " if c.get("label") else ""

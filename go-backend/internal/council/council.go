@@ -84,6 +84,9 @@ type QueryResult struct {
 	// Routing records how the strategy and document use were decided. It is
 	// set by the HTTP layer.
 	Routing *RoutingInfo `json:"routing,omitempty"`
+	// Retrieval describes the document chunks used as evidence (set by the
+	// HTTP layer when a document was retrieved).
+	Retrieval *RetrievalInfo `json:"retrieval,omitempty"`
 	// TokenUsage sums provider-reported usage over every call in this request
 	// (candidates, reviews, chairman, reflection). Nil when no provider
 	// reported usage; calls without usage are not estimated.
@@ -186,6 +189,29 @@ type RoutingInfo struct {
 	GroundingError string `json:"grounding_error,omitempty"`
 	// WebSources attributes web results when Grounding is "web".
 	WebSources []WebSource `json:"web_sources,omitempty"`
+}
+
+// RetrievalInfo is what the RAG service reported for a document retrieval.
+type RetrievalInfo struct {
+	Reranked       bool            `json:"reranked"`
+	RerankError    string          `json:"rerank_error,omitempty"`
+	Candidates     int             `json:"candidates"`
+	DistanceMetric string          `json:"distance_metric,omitempty"`
+	Chunks         []DocumentChunk `json:"chunks"`
+}
+
+// DocumentChunk is one retrieved chunk with the structural metadata the RAG
+// service stored. Optional fields are nil when the source did not provide them.
+type DocumentChunk struct {
+	Content        string   `json:"content"`
+	ChunkType      string   `json:"chunk_type"`
+	PageNumber     int      `json:"page_number"` // 0 = unknown
+	PageEnd        int      `json:"page_end,omitempty"`
+	ChunkIndex     int      `json:"chunk_index"`
+	OCRMethod      string   `json:"ocr_method,omitempty"`
+	OCRConfidence  *float64 `json:"ocr_confidence,omitempty"`
+	VectorDistance *float64 `json:"vector_distance,omitempty"`
+	RerankScore    *float64 `json:"rerank_score,omitempty"`
 }
 
 // WebSource is one web search result used as evidence.

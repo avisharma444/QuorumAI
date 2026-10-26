@@ -1,17 +1,22 @@
 services:
   python-rag:
-    build: ./python-rag
+    build:
+      context: ./python-rag
+      target: runtime
     ports:
       - "8000:8000"
     volumes:
-      - documents:/data
-    environment:
-      - EMBEDDING_BACKEND=hash
+      - chroma-data:/data/chroma_db
+      - hf-models:/models
+      - ./config.yaml:/app/config.yaml:ro
+    # Ready only after the embedding model, reranker and Chroma store load
+    # (the first start downloads the weights into hf-models).
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 5s
-      timeout: 3s
-      retries: 15
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 600s
 
   go-backend:
     build: ./go-backend
@@ -37,4 +42,7 @@ services:
       - go-backend
 
 volumes:
-  documents:
+  chroma-data:
+  # Shared with the test image so model weights are downloaded only once.
+  hf-models:
+    name: councilai-hf

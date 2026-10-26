@@ -9,8 +9,8 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 - **Go 1.23 control plane:** `POST /api/v1/query`, `POST /api/v1/ingest`, `GET /health`, `GET /metrics`.
 - **Concurrent council:** configurable 3 LLM models, parallel candidate generation, parallel peer reviews, chairman synthesis, defensive fallbacks, optional reflection/revision.
 - **Response streaming:** SSE events (`start`, `retrieved`, `candidate`, `review`, `final`; plus errors/fallbacks).
-- **Python FastAPI RAG service:** PDF/TXT/Markdown text extraction, overlapping per-page chunks, 384-D vectors, retrieval ranked by cosine similarity.
-- **Persistent document store:** SQLite, so ingested documents survive service restarts.
+- **Python FastAPI RAG service (reference architecture):** document inspection → adaptive extraction (PyPDF2 text layer, pdfplumber layout/tables, Tesseract OCR for images and scanned PDFs) → layout-aware chunks (tables kept whole, headings attached, captions grouped) → `BAAI/bge-small-en-v1.5` embeddings (mean pooling, 384-D, CPU) → persistent **ChromaDB** collection per document → `cross-encoder/ms-marco-MiniLM-L-6-v2` reranking of 3×k vector candidates. Endpoints: `/ingest`, `/retrieve`, `/retrieve-all`, `/embed`, `/search`, `/health` (liveness), `/ready` (models loaded).
+- **Persistence:** Chroma data in the `chroma-data` volume; model weights in the `councilai-hf` volume (downloaded once). Re-uploading identical bytes replaces that document atomically.
 - **Exact-query cache:** thread-safe Go in-process TTL cache (one-hour TTL) for repeated questions.
 - **Streamlit UI:** document upload, model stages, candidate/review inspection.
 - **Safe default testing:** `MOCK_LLM=true` runs without model API keys, using clearly identified mock answers.
@@ -19,14 +19,13 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 ### Deliberately NOT implemented yet
 
 - Redis Stack L1+L2 semantic cache and circuit breaker
-- ChromaDB vector store, cross-encoder reranking, scanned-PDF OCR
 - JWT authentication and PostgreSQL user storage
 - Prometheus/Grafana/OpenTelemetry instrumentation (the current `/metrics` is a JSON counter endpoint)
 - Calibrated confidence scores, quality improvement claims, performance claims, or load-test evidence
 - Multi-user authorization and protection of uploaded documents
-- OpenRouter/Gemini-specific structured response adapters, retries/rate budgets, production deployment and hardening
+- Provider retries/rate budgets, production deployment and hardening
 
-**Embeddings caveat:** The default `hash` backend uses *hashed lexical token vectors* (384 dimensions) to make local builds fast and testable; it is **not** genuine semantic embedding. Set `EMBEDDING_BACKEND=sentence-transformer` with the extra neural requirements to use a small 384-dimensional MiniLM embedding model. The default SQLite cosine store is **not ChromaDB**.
+**Retrieval notes:** embeddings are mean-pooled and not normalised (as in the reference), and Chroma uses L2 distance, so `vector_distance` is a raw distance, not a similarity. Cross-encoder `rerank_score` values are raw logits for ordering, not probabilities. Text-layer PDFs extracted with PyPDF2 produce one block per page, so their chunks can be large; PDFs with tables go through pdfplumber, which keeps paragraphs, tables and captions in page order. Multi-column reading order is not reconstructed. The starter's hashed-vector/SQLite retrieval survives only as a benchmark baseline in `python-rag/app/baselines/`.
 
 ## Quick start: Docker on Mac M2
 
@@ -50,11 +49,13 @@ Requires Go 1.23+, Python 3.11+. From the project root:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r python-rag/requirements.txt pytest requests
+# CPU-only torch first, then the service (needs tesseract + poppler: brew install tesseract poppler)
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+pip install -r python-rag/requirements-dev.txt requests
 
-# Terminal A
+# Terminal A (first start downloads ~220 MB of model weights into HF_HOME)
 cd python-rag
-DATABASE_PATH=./documents.sqlite3 uvicorn app.main:app --reload --port 8000
+CHROMA_DB_PATH=./chroma_db uvicorn app.main:app --reload --port 8000
 
 # Terminal B, from project root
 cd go-backend
@@ -147,8 +148,10 @@ include provider-reported token usage per call and in total (`token_usage`).
 ```bash
 # Go tests, including race detector
 (cd go-backend && go test -race ./...)
-# Python pure-core tests
-(cd python-rag && pip install -r requirements-dev.txt && python -m pytest -q tests)
+# Python tests, including real OCR and real-model integration tests (Docker, no local installs)
+(cd python-rag && docker build --target test -t councilai-rag-test . && docker run --rm -v councilai-hf:/models councilai-rag-test)
+# Retrieval evaluation (40-chunk fictional corpus, 30 queries): hash baseline vs neural vs neural + rerank
+docker run --rm -v councilai-hf:/models councilai-rag-test python -m benchmarks.rag_eval [--pdf]
 # Both API servers must be running for the smoke test
 python tests/e2e_smoke.py
 # Both API servers must be running for the HTTP benchmark

@@ -77,6 +77,11 @@ type yamlSchema struct {
 	RAG struct {
 		ServiceURL string `yaml:"service_url"`
 		WebSearch  *bool  `yaml:"web_search"`
+		// Read by the Python RAG service; accepted here so strict parsing passes.
+		ChromaDBPath       string `yaml:"chroma_db_path"`
+		EmbeddingModel     string `yaml:"embedding_model"`
+		EmbeddingDimension int    `yaml:"embedding_dimension"`
+		RerankerModel      string `yaml:"reranker_model"`
 	} `yaml:"rag"`
 	Providers struct {
 		OpenRouterURL string `yaml:"openrouter_url"`

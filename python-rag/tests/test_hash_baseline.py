@@ -1,4 +1,4 @@
-from app.core import DocumentStore, Embedder, chunk_pages, extract_pages
+from app.baselines.hash_retrieval import DocumentStore, Embedder, chunk_pages, extract_pages
 
 
 def test_chunking_page_boundary_and_overlap():

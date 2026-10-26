@@ -157,7 +157,7 @@ func TestDocumentRetrievalFeedsTheCouncil(t *testing.T) {
 		var req map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		gotDoc, _ = req["doc_id"].(string)
-		fmt.Fprint(w, `{"chunks":[{"text":"The sky is green on Zog.","page":2,"score":0.9}]}`)
+		fmt.Fprint(w, `{"chunks":[{"content":"The sky is green on Zog.","chunk_type":"paragraph","page_number":2,"chunk_index":3,"metadata":{"ocr_method":"tesseract","ocr_confidence":0.91,"vector_distance":3.1,"rerank_score":2.5}}],"reranked":true,"candidates":5,"distance_metric":"l2"}`)
 	}))
 	defer rag.Close()
 	f := llmtest.New(nil)

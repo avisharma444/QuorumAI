@@ -69,7 +69,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("Content-Type", contentType)
-	res, err := s.HTTP.Do(req)
+	// Ingestion runs OCR and embeddings, so it gets the request timeout
+	// rather than the short client timeout used for retrieval.
+	res, err := (&http.Client{Timeout: s.RequestTimeout, Transport: s.HTTP.Transport}).Do(req)
 	if err != nil {
 		respondError(w, 502, "RAG service unavailable: "+err.Error())
 		return

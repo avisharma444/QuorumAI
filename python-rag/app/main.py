@@ -1,63 +1,40 @@
-"""RAG HTTP service. Launch with uvicorn app.main:app --port 8000."""
+"""RAG HTTP service (reference app/main.py). Run: uvicorn app.main:app --port 8000."""
 from __future__ import annotations
 
-import os
+import logging
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-from .core import DocumentStore, Embedder
-from .search_agent import WebSearchAgent
+from app import state
+from app.routers import embed, ingest, retrieve, retrieve_all, search
 
-app = FastAPI(title="CouncilAI document retrieval", version="0.1.0")
-store = DocumentStore(os.getenv("DATABASE_PATH", "./documents.sqlite3"), Embedder())
-search_agent = WebSearchAgent()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
-class RetrieveRequest(BaseModel):
-    doc_id: str = Field(min_length=1, max_length=64)
-    question: str = Field(min_length=1, max_length=10000)
-    top_k: int = Field(default=4, ge=1, le=10)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state.services.start_background_load()
+    yield
+
+
+app = FastAPI(title="CouncilAI RAG Service", version="1.0.0", lifespan=lifespan)
+app.include_router(ingest.router, tags=["Ingestion"])
+app.include_router(retrieve.router, tags=["Retrieval"])
+app.include_router(retrieve_all.router, tags=["Retrieval"])
+app.include_router(embed.router, tags=["Embedding"])
+app.include_router(search.router, tags=["Web Search"])
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "python-rag", "embedding_backend": store.embedder.backend}
+    """Liveness: the process is up. See "ready" for model readiness."""
+    return {"status": "ok", "service": "python-rag", **state.services.status()}
 
 
-@app.post("/ingest")
-async def ingest(file: UploadFile = File(...)) -> dict:
-    raw = await file.read(10 * 1024 * 1024 + 1)
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(413, "File exceeds 10 MiB")
-    try:
-        return store.ingest(file.filename or "upload.txt", raw)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(422, f"Unable to parse file: {type(exc).__name__}") from exc
-
-
-@app.post("/retrieve")
-def retrieve(req: RetrieveRequest) -> dict:
-    try:
-        return {"doc_id": req.doc_id, "chunks": store.retrieve(req.doc_id, req.question, req.top_k)}
-    except KeyError as exc:
-        raise HTTPException(404, "Document not found") from exc
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-class SearchRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=10000)
-    max_results: int = Field(default=3, ge=1, le=10)
-
-
-@app.post("/search")
-def web_search(req: SearchRequest) -> dict:
-    """Live web-search grounding (reference: routers/search.py).
-
-    Always 200 with a status, so search problems degrade the answer's grounding
-    rather than failing the query: "ok", "no_results" or "search_failed".
-    """
-    return search_agent.search(req.query, req.max_results).as_dict()
+@app.get("/ready")
+def ready():
+    """Readiness: 200 only when the embedding model, reranker and Chroma store are loaded."""
+    body = {"service": "python-rag", **state.services.status()}
+    return JSONResponse(body, status_code=200 if body["ready"] else 503)

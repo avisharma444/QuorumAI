@@ -50,7 +50,7 @@ func newFakeRAG(t *testing.T) *fakeRAG {
 			fmt.Fprintf(w, `{"doc_id":"doc-%d","filename":"z.md","pages":1,"chunks":1,"chunk_count":1,"preview_text":%s}`, n, preview)
 		case "/retrieve":
 			w.WriteHeader(f.retrieveStatus)
-			fmt.Fprint(w, `{"chunks":[{"text":"The capital of Zogland is Mirevale.","page":1,"score":0.9}]}`)
+			fmt.Fprint(w, `{"chunks":[{"content":"The capital of Zogland is Mirevale.","chunk_type":"paragraph","page_number":1,"chunk_index":0,"metadata":{"ocr_method":"direct_text","vector_distance":4.2,"rerank_score":7.5}}],"reranked":true,"candidates":3,"distance_metric":"l2"}`)
 		case "/search":
 			w.WriteHeader(f.searchStatus)
 			fmt.Fprint(w, f.searchBody)

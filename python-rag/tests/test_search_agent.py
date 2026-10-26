@@ -1,6 +1,6 @@
 import requests
 
-from app.search_agent import WebSearchAgent, extract_paragraphs, is_public_url
+from app.retrieval.search_agent import WebSearchAgent, extract_paragraphs, is_public_url
 
 PARA = "This paragraph is long enough to count as substantive page content for grounding."
 

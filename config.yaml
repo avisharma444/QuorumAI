@@ -13,6 +13,12 @@ rag:
   # Questions without a document are grounded with DuckDuckGo results via the
   # RAG service's /search endpoint (reference behaviour). WEB_SEARCH_ENABLED overrides.
   web_search: true
+  # Python RAG service (reference keys). Weights download once into the
+  # hf-models volume; Chroma data lives in the chroma-data volume.
+  chroma_db_path: "/data/chroma_db"
+  embedding_model: "BAAI/bge-small-en-v1.5"
+  embedding_dimension: 384
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 providers:
   openrouter_url: "https://openrouter.ai/api/v1/chat/completions"

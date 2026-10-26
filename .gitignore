@@ -21,3 +21,10 @@ coverage.*
 # Local secrets
 .env.*
 !.env.example
+# RAG data and model caches (live in Docker volumes; never commit)
+chroma_db/
+**/chroma_db/
+.cache/
+models/
+benchmarks/results/
+python-rag/benchmarks/results/

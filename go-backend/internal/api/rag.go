@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"example.com/councilai-starter/internal/council"
 )
@@ -15,34 +16,85 @@ import (
 // errDocumentNotFound means the RAG service has no document with that ID.
 var errDocumentNotFound = errors.New("document not found")
 
-// Retrieve fetches the top-K chunks of q.DocID relevant to the question.
-func (s *Server) Retrieve(ctx context.Context, q council.QueryRequest) ([]string, error) {
+// ragChunk is the RAG service's Chunk model (reference app/models.py).
+type ragChunk struct {
+	Content    string         `json:"content"`
+	ChunkType  string         `json:"chunk_type"`
+	PageNumber int            `json:"page_number"`
+	ChunkIndex int            `json:"chunk_index"`
+	Metadata   map[string]any `json:"metadata"`
+}
+
+func metaFloat(m map[string]any, key string) *float64 {
+	if v, ok := m[key].(float64); ok {
+		return &v
+	}
+	return nil
+}
+
+func metaInt(m map[string]any, key string) int {
+	if v, ok := m[key].(float64); ok {
+		return int(v)
+	}
+	return 0
+}
+
+// excerptLabel cites only provenance the RAG service actually reported.
+func excerptLabel(docID string, c council.DocumentChunk) string {
+	parts := []string{"Document " + docID}
+	switch {
+	case c.PageNumber > 0 && c.PageEnd > c.PageNumber:
+		parts = append(parts, fmt.Sprintf("pages %d-%d", c.PageNumber, c.PageEnd))
+	case c.PageNumber > 0:
+		parts = append(parts, fmt.Sprintf("page %d", c.PageNumber))
+	}
+	if c.ChunkType == "table" {
+		parts = append(parts, "table")
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// Retrieve fetches the top-K chunks of q.DocID relevant to the question
+// (vector search plus cross-encoder rerank in the RAG service).
+func (s *Server) Retrieve(ctx context.Context, q council.QueryRequest) ([]string, *council.RetrievalInfo, error) {
 	if q.DocID == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	topK := q.TopK
 	if topK <= 0 || topK > 10 {
 		topK = 4
 	}
 	var data struct {
-		Chunks []struct {
-			Text  string  `json:"text"`
-			Page  int     `json:"page"`
-			Score float64 `json:"score"`
-		} `json:"chunks"`
+		Chunks         []ragChunk `json:"chunks"`
+		Reranked       bool       `json:"reranked"`
+		RerankError    *string    `json:"rerank_error"`
+		Candidates     int        `json:"candidates"`
+		DistanceMetric string     `json:"distance_metric"`
 	}
-	status, err := s.postRAG(ctx, "/retrieve", map[string]any{"doc_id": q.DocID, "question": q.Question, "top_k": topK}, &data)
+	status, err := s.postRAG(ctx, "/retrieve", map[string]any{"doc_id": q.DocID, "question": q.Question, "top_k": topK, "rerank": true}, &data)
 	if status == http.StatusNotFound {
-		return nil, errDocumentNotFound
+		return nil, nil, errDocumentNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	info := &council.RetrievalInfo{Reranked: data.Reranked, Candidates: data.Candidates, DistanceMetric: data.DistanceMetric}
+	if data.RerankError != nil {
+		info.RerankError = *data.RerankError
 	}
 	excerpts := make([]string, 0, len(data.Chunks))
-	for _, chunk := range data.Chunks {
-		excerpts = append(excerpts, fmt.Sprintf("[Document %s, page %d] %s", q.DocID, chunk.Page, chunk.Text))
+	for _, c := range data.Chunks {
+		m := c.Metadata
+		dc := council.DocumentChunk{
+			Content: c.Content, ChunkType: c.ChunkType, PageNumber: c.PageNumber, ChunkIndex: c.ChunkIndex,
+			PageEnd: metaInt(m, "page_end"), OCRConfidence: metaFloat(m, "ocr_confidence"),
+			VectorDistance: metaFloat(m, "vector_distance"), RerankScore: metaFloat(m, "rerank_score"),
+		}
+		dc.OCRMethod, _ = m["ocr_method"].(string)
+		info.Chunks = append(info.Chunks, dc)
+		excerpts = append(excerpts, excerptLabel(q.DocID, dc)+" "+c.Content)
 	}
-	return excerpts, nil
+	return excerpts, info, nil
 }
 
 // webSearchResult is the Python /search response.

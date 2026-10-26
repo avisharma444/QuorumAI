@@ -141,27 +141,27 @@ func (s *Server) plan(ctx context.Context, q council.QueryRequest, mode, overrid
 //
 // Retrieval and search failures degrade to an ungrounded answer and are
 // recorded in info.GroundingError; an unknown document is a client error.
-func (s *Server) evidence(ctx context.Context, q council.QueryRequest, info *council.RoutingInfo) (council.Evidence, error) {
+func (s *Server) evidence(ctx context.Context, q council.QueryRequest, info *council.RoutingInfo) (council.Evidence, *council.RetrievalInfo, error) {
 	switch {
 	case info.DocumentAttached && info.NeedsDoc:
-		chunks, err := s.Retrieve(ctx, q)
+		chunks, retrieval, err := s.Retrieve(ctx, q)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return council.Evidence{}, ctxErr
+			return council.Evidence{}, nil, ctxErr
 		}
 		if errors.Is(err, errDocumentNotFound) {
-			return council.Evidence{}, &requestError{http.StatusNotFound, "document not found: " + q.DocID}
+			return council.Evidence{}, nil, &requestError{http.StatusNotFound, "document not found: " + q.DocID}
 		}
 		if err != nil {
 			log.Printf("[Query] Retrieval failed: %v, answering without document evidence", err)
 			info.GroundingError = "document retrieval failed: " + err.Error()
-			return council.Evidence{}, nil
+			return council.Evidence{}, nil, nil
 		}
 		info.DocumentUsed = len(chunks) > 0
-		return council.Evidence{Kind: council.EvidenceDocument, Passages: chunks}, nil
+		return council.Evidence{Kind: council.EvidenceDocument, Passages: chunks}, retrieval, nil
 	case !info.DocumentAttached && s.WebSearch:
 		res, err := s.SearchWeb(ctx, q.Question)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return council.Evidence{}, ctxErr
+			return council.Evidence{}, nil, ctxErr
 		}
 		switch {
 		case err != nil:
@@ -173,11 +173,11 @@ func (s *Server) evidence(ctx context.Context, q council.QueryRequest, info *cou
 			}
 		default:
 			info.WebSources = res.Sources
-			return council.Evidence{Kind: council.EvidenceWeb, Passages: res.Results}, nil
+			return council.Evidence{Kind: council.EvidenceWeb, Passages: res.Results}, nil, nil
 		}
 		log.Printf("[Query] %s; answering without web grounding", info.GroundingError)
 	}
-	return council.Evidence{}, nil
+	return council.Evidence{}, nil, nil
 }
 
 func addUsage(a, b *llm.Usage) *llm.Usage {
@@ -260,7 +260,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	emit("routing", info)
 
-	ev, err := s.evidence(ctx, q, &info)
+	ev, retrieval, err := s.evidence(ctx, q, &info)
 	var reqErr *requestError
 	if errors.As(err, &reqErr) {
 		fail(reqErr.status, reqErr.msg)
@@ -281,6 +281,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	decorate := func(res *council.QueryResult) {
 		info := info
 		res.Routing = &info
+		res.Retrieval = retrieval
 		res.TokenUsage = addUsage(res.TokenUsage, routerUsage)
 	}
 	runEmit := func(name string, v any) {
