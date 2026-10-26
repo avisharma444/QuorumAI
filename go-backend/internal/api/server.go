@@ -2,6 +2,12 @@
 package api
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"example.com/councilai-starter/internal/metrics"
+	"example.com/councilai-starter/internal/telemetry"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"example.com/councilai-starter/internal/agent"
@@ -47,7 +52,7 @@ type Server struct {
 	// Semantic is the L2 RediSearch cache; nil disables it.
 	Semantic          cache.SemanticCache
 	SemanticThreshold float64
-	// Breaker is the shared Redis breaker, reported by /health and /metrics.
+	// Breaker is the shared Redis breaker, reported by /health and Prometheus.
 	Breaker cache.CircuitBreaker
 	// SemanticReuse enables L2 answer reuse. Off by default in production:
 	// measured false-positive rates are too high (see README).
@@ -67,11 +72,6 @@ type Server struct {
 	// HistoryExchanges is how many earlier exchanges are sent to the models
 	// (reference: 5).
 	HistoryExchanges int
-
-	Requests atomic.Uint64
-	Hits     atomic.Uint64 // L1 hits
-	L2Hits   atomic.Uint64
-	Failures atomic.Uint64
 }
 
 func NewServer(c *council.Council, ragURL string) *Server {
@@ -143,10 +143,16 @@ func (s *Server) plan(ctx context.Context, q council.QueryRequest, mode, overrid
 		info.Reasoning = "No router configured, using default council strategy."
 		return info, nil, nil
 	}
-	p, err := s.Router.PlanWithDocument(ctx, q.Question, agent.DocumentContext{Attached: info.DocumentAttached, Summary: summary})
+	rctx, span := telemetry.Start(ctx, "router.plan")
+	p, err := s.Router.PlanWithDocument(rctx, q.Question, agent.DocumentContext{Attached: info.DocumentAttached, Summary: summary})
 	if err != nil {
+		telemetry.Fail(span, "cancelled")
+		span.End()
 		return info, nil, err
 	}
+	span.SetAttributes(attribute.String("router.strategy", p.Strategy), attribute.Bool("router.needs_doc", p.NeedsDoc), attribute.Bool("router.fallback", p.Fallback))
+	span.End()
+	metrics.RouterDecisions.WithLabelValues(strategyLabel(p.Strategy), strconv.FormatBool(p.Fallback)).Inc()
 	info.Strategy, info.Reasoning, info.NeedsDoc, info.Fallback = p.Strategy, p.Reasoning, p.NeedsDoc, p.Fallback
 	info.RouterModel = s.Router.ModelName()
 	return info, p.Usage, nil
@@ -216,7 +222,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		respondError(w, 405, "POST required")
 		return
 	}
-	s.Requests.Add(1)
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
 	var q council.QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
@@ -253,12 +258,22 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), s.RequestTimeout)
 	defer cancel()
+	obs := &queryObservation{strategy: "none", outcome: "rejected"}
+	var ci *council.CacheInfo
+	defer func() { s.recordQuery(ctx, obs, ci) }()
 
 	// Authorization comes before any summary, cache or retrieval access. A
 	// document the user has no grant for gets the same 404 as one that does
 	// not exist, so document IDs reveal nothing about other users.
 	if q.DocID != "" {
-		if status, msg := s.authorizeDocument(ctx, userID, q.DocID); status != 0 {
+		actx, span := telemetry.Start(ctx, "auth.document_access")
+		status, msg := s.authorizeDocument(actx, userID, q.DocID)
+		span.SetAttributes(attribute.Int("auth.document_access.status", status))
+		if status == http.StatusServiceUnavailable {
+			telemetry.Fail(span, "authorization_unavailable")
+		}
+		span.End()
+		if status != 0 {
 			respondError(w, status, msg)
 			return
 		}
@@ -278,7 +293,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sess = &council.SessionInfo{ID: q.SessionID}
-		turns, err := s.Memory.GetHistory(ctx, userID, q.SessionID, s.HistoryExchanges)
+		hctx, span := telemetry.Start(ctx, "conversation.load")
+		turns, err := s.Memory.GetHistory(hctx, userID, q.SessionID, s.HistoryExchanges)
+		span.SetAttributes(attribute.Int("conversation.turns", len(turns)))
+		if err != nil {
+			telemetry.Fail(span, "history_unavailable")
+			metrics.ConversationOps.WithLabelValues("load", "error").Inc()
+			metrics.DependencyErrors.WithLabelValues("redis", "conversation_load").Inc()
+		} else {
+			metrics.ConversationOps.WithLabelValues("load", "ok").Inc()
+		}
+		span.End()
 		if err != nil {
 			if ctx.Err() != nil {
 				respondError(w, http.StatusGatewayTimeout, "cancelled")
@@ -293,7 +318,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	stateless := sess == nil || (sess.HistoryUsed == 0 && sess.Error == "")
 
-	ci := &council.CacheInfo{Tier: "none", L1: "disabled", L2: "disabled"}
+	ci = &council.CacheInfo{Tier: "none", L1: "disabled", L2: "disabled"}
 	switch {
 	case s.Semantic != nil && !s.SemanticReuse:
 		ci.L2 = "disabled_by_policy" // SEMANTIC_CACHE_ENABLED=false
@@ -311,15 +336,22 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if s.Cache != nil && stateless {
 		t := time.Now()
 		var prev council.QueryResult
-		hit, err := s.Cache.Get(ctx, key, &prev)
+		lctx, span := telemetry.Start(ctx, "cache.l1_lookup")
+		hit, err := s.Cache.Get(lctx, key, &prev)
 		lookup += time.Since(t)
+		metrics.CacheLookupDuration.WithLabelValues("l1_exact").Observe(time.Since(t).Seconds())
 		ci.L1 = cacheStatus(err)
+		span.SetAttributes(attribute.String("cache.result", map[bool]string{true: "hit", false: ci.L1}[hit]))
+		if err != nil && ci.L1 != "cancelled" {
+			telemetry.Fail(span, "cache_"+ci.L1)
+		}
+		span.End()
 		if err != nil && ci.L1 != "cancelled" {
 			log.Printf("[Cache] L1 lookup degraded (%s): %v", ci.L1, err)
 		}
 		if hit {
-			s.Hits.Add(1)
 			ci.Tier, ci.L1, ci.LookupMS = "l1_exact", "hit", ms(lookup)
+			obs.strategy, obs.outcome = strategyLabel(prev.Strategy), "answered"
 			prev.Session = s.saveExchange(ctx, userID, sess, q.Question, prev.Answer)
 			s.serveCached(w, wantsStream, nil, prev, ci, nil, started)
 			return
@@ -332,7 +364,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		emit("start", map[string]string{"mode": mode, "strategy": override})
 	}
 	fail := func(status int, msg string) {
-		s.Failures.Add(1)
+		obs.outcome = "failed"
+		if ctx.Err() != nil {
+			obs.outcome = "cancelled"
+		}
 		if wantsStream {
 			emit("error", map[string]any{"error": msg, "status": status})
 		} else {
@@ -347,6 +382,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ci.RouterCalled = mode == ModeAuto && s.Router != nil
+	obs.strategy = strategyLabel(info.Strategy)
 	emit("routing", info)
 
 	// 3. L2 semantic lookup, only for document-grounded plans and only
@@ -359,26 +395,34 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		ci.L2 = "ineligible"
 		if info.DocumentAttached && info.NeedsDoc && !info.Fallback {
 			t := time.Now()
-			vec, embModel, err := s.embedQuery(ctx, q.Question)
+			l2ctx, l2span := telemetry.Start(ctx, "cache.l2_lookup")
+			vec, embModel, err := s.embedQuery(l2ctx, q.Question)
 			if err != nil {
 				if ctx.Err() != nil {
+					telemetry.Fail(l2span, "cancelled")
+					l2span.End()
 					fail(http.StatusGatewayTimeout, "cancelled: "+ctx.Err().Error())
 					return
 				}
 				ci.L2 = "embed_failed"
+				telemetry.Fail(l2span, "embed_failed")
 				log.Printf("[Cache] L2 skipped, embedding failed: %v", err)
 			} else {
 				vector = vec
 				scope = s.semanticScope(userID, q, mode, override, info.Strategy, embModel)
 				var prev council.QueryResult
-				hit, found, err := s.Semantic.Get(ctx, scope, normalizeQuestion(q.Question), vector, s.SemanticThreshold, &prev)
+				hit, found, err := s.Semantic.Get(l2ctx, scope, normalizeQuestion(q.Question), vector, s.SemanticThreshold, &prev)
 				ci.L2 = cacheStatus(err)
 				if err != nil && ci.L2 != "cancelled" {
+					telemetry.Fail(l2span, "cache_"+ci.L2)
 					log.Printf("[Cache] L2 lookup degraded (%s): %v", ci.L2, err)
 				}
 				if found {
 					lookup += time.Since(t)
-					s.L2Hits.Add(1)
+					metrics.CacheLookupDuration.WithLabelValues("l2_semantic").Observe(time.Since(t).Seconds())
+					l2span.SetAttributes(attribute.String("cache.result", "hit"), attribute.Float64("cache.similarity", hit.Similarity))
+					l2span.End()
+					obs.outcome = "answered"
 					dist, sim, thr := hit.Distance, hit.Similarity, s.SemanticThreshold
 					ci.Tier, ci.L2, ci.LookupMS = "l2_semantic", "hit", ms(lookup)
 					ci.Distance, ci.Similarity, ci.Threshold = &dist, &sim, &thr
@@ -388,6 +432,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			lookup += time.Since(t)
+			metrics.CacheLookupDuration.WithLabelValues("l2_semantic").Observe(time.Since(t).Seconds())
+			l2span.SetAttributes(attribute.String("cache.result", ci.L2))
+			l2span.End()
 		}
 	}
 	ci.LookupMS = ms(lookup)
@@ -443,9 +490,44 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	} else {
 		result = *final
 	}
+	obs.outcome = "answered"
 	if !wantsStream {
 		respond(w, 200, result)
 	}
+}
+
+// queryObservation is what recordQuery reports for one /query request.
+type queryObservation struct{ strategy, outcome string }
+
+// recordQuery runs once per query request (deferred): cache lookups are
+// counted exactly once per tier, and the request span gets the strategy,
+// answer tier and outcome. Requests rejected before caching (bad input,
+// unauthorized document) record only the outcome.
+func (s *Server) recordQuery(ctx context.Context, obs *queryObservation, ci *council.CacheInfo) {
+	tier := "none"
+	if ci != nil {
+		tier = ci.Tier
+		metrics.CacheOperations.WithLabelValues("l1_exact", metrics.CacheResult(ci.L1)).Inc()
+		metrics.CacheOperations.WithLabelValues("l2_semantic", metrics.CacheResult(ci.L2)).Inc()
+	}
+	if obs.outcome == "answered" || obs.outcome == "failed" || obs.outcome == "cancelled" || ci != nil {
+		metrics.QueryOutcomes.WithLabelValues(obs.strategy, tier, obs.outcome).Inc()
+	}
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("query.strategy", obs.strategy), attribute.String("query.outcome", obs.outcome),
+		attribute.String("cache.tier", tier))
+	if ci != nil {
+		span.SetAttributes(attribute.String("cache.l1", ci.L1), attribute.String("cache.l2", ci.L2),
+			attribute.Bool("inference.executed", ci.InferenceExecuted))
+	}
+}
+
+// strategyLabel bounds the strategy label to the known strategies.
+func strategyLabel(st string) string {
+	if council.ValidStrategy(st) {
+		return st
+	}
+	return "unknown"
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -459,18 +541,30 @@ func (s *Server) storeResult(ctx context.Context, key string, scope cache.Scope,
 	stored.Cache, stored.CacheHit, stored.Session = nil, false, nil
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
+	wctx, span := telemetry.Start(wctx, "cache.store")
+	defer func() {
+		span.SetAttributes(attribute.StringSlice("cache.stored", ci.Stored))
+		if ci.WriteError != "" {
+			telemetry.Fail(span, "cache_write_failed")
+		}
+		span.End()
+	}()
 	var errs []string
 	if s.Cache != nil {
 		if err := s.Cache.Set(wctx, key, stored); err != nil {
 			errs = append(errs, "l1: "+err.Error())
+			metrics.CacheWrites.WithLabelValues("l1_exact", "error").Inc()
 		} else {
+			metrics.CacheWrites.WithLabelValues("l1_exact", "ok").Inc()
 			ci.Stored = append(ci.Stored, "l1_exact")
 		}
 	}
 	if s.Semantic != nil && s.SemanticReuse && vector != nil && res.Grounding == council.EvidenceDocument {
 		if err := s.Semantic.Put(wctx, scope, normalizeQuestion(question), vector, stored); err != nil {
 			errs = append(errs, "l2: "+err.Error())
+			metrics.CacheWrites.WithLabelValues("l2_semantic", "error").Inc()
 		} else {
+			metrics.CacheWrites.WithLabelValues("l2_semantic", "ok").Inc()
 			ci.Stored = append(ci.Stored, "l2_semantic")
 		}
 	}
@@ -488,6 +582,7 @@ func (s *Server) authorizeDocument(ctx context.Context, userID, docID string) (i
 	}
 	ok, err := s.Docs.HasDocumentAccess(ctx, userID, docID)
 	if err != nil {
+		metrics.DependencyErrors.WithLabelValues("postgres", "document_access").Inc()
 		log.Printf("[Auth] document access check failed: %v", err)
 		return http.StatusServiceUnavailable, "document authorization unavailable"
 	}
@@ -510,14 +605,20 @@ func (s *Server) saveExchange(ctx context.Context, userID string, sess *council.
 	}
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
+	wctx, span := telemetry.Start(wctx, "conversation.save")
+	defer span.End()
 	now := time.Now().UTC()
 	err := s.Memory.AppendExchange(wctx, userID, sess.ID,
 		memory.Turn{Role: "user", Content: question, Timestamp: now},
 		memory.Turn{Role: "assistant", Content: answer, Timestamp: now})
 	if err != nil {
 		out.Error = "conversation could not be saved: " + err.Error()
+		telemetry.Fail(span, "save_failed")
+		metrics.ConversationOps.WithLabelValues("save", "error").Inc()
+		metrics.DependencyErrors.WithLabelValues("redis", "conversation_save").Inc()
 	} else {
 		out.Saved = true
+		metrics.ConversationOps.WithLabelValues("save", "ok").Inc()
 	}
 	return &out
 }

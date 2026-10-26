@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from app import state
 from app.routers import embed, ingest, retrieve, retrieve_all, search
+from app.telemetry import setup_tracing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -25,6 +26,7 @@ app.include_router(retrieve.router, tags=["Retrieval"])
 app.include_router(retrieve_all.router, tags=["Retrieval"])
 app.include_router(embed.router, tags=["Embedding"])
 app.include_router(search.router, tags=["Web Search"])
+setup_tracing(app)
 
 
 @app.get("/health")

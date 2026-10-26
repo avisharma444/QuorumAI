@@ -1,6 +1,11 @@
 package middleware
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+
+	"example.com/councilai-starter/internal/metrics"
+	"example.com/councilai-starter/internal/telemetry"
+
 	"context"
 	"errors"
 	"fmt"
@@ -71,6 +76,7 @@ type RateLimiter struct {
 	prefix    string
 	policy    FailurePolicy
 	opTimeout time.Duration
+	name      string // metric label: the prefix ("user", "auth")
 }
 
 // NewRateLimiter builds a limiter. prefix separates independent limits
@@ -88,7 +94,7 @@ func NewRateLimiter(client *redis.Client, cb cache.CircuitBreaker, rps float64, 
 	return &RateLimiter{
 		client: client, cb: cb, script: redis.NewScript(gcraScript),
 		interval: time.Duration(float64(time.Second) / rps), burst: burst,
-		prefix: "councilai:v1:ratelimit:" + prefix + ":", policy: policy, opTimeout: 300 * time.Millisecond,
+		prefix: "councilai:v1:ratelimit:" + prefix + ":", policy: policy, opTimeout: 300 * time.Millisecond, name: limiterLabel(prefix),
 	}, nil
 }
 
@@ -124,17 +130,25 @@ func (rl *RateLimiter) Middleware(identity func(*http.Request) (string, bool)) f
 				writeJSONError(w, http.StatusUnauthorized, "unauthenticated")
 				return
 			}
-			d, err := rl.Allow(r.Context(), id)
+			ctx, span := telemetry.Start(r.Context(), "ratelimit.check", attribute.String("ratelimit.limiter", rl.name))
+			d, err := rl.Allow(ctx, id)
+			span.SetAttributes(attribute.Bool("ratelimit.allowed", err == nil && d.Allowed))
+			if err != nil {
+				telemetry.Fail(span, "limiter_unavailable")
+			}
+			span.End()
 			if err != nil {
 				if r.Context().Err() != nil {
 					return // client gone
 				}
+				metrics.DependencyErrors.WithLabelValues("redis", "rate_limit").Inc()
 				if rl.policy == FailOpen {
 					slog.Warn("rate limiter unavailable; failing open", "error", err.Error())
 					next.ServeHTTP(w, r)
 					return
 				}
 				slog.Error("rate limiter unavailable; failing closed", "error", err.Error())
+				metrics.RateLimitRejections.WithLabelValues(rl.name, "unavailable").Inc()
 				w.Header().Set("Retry-After", "5")
 				writeJSONError(w, http.StatusServiceUnavailable, "rate limiter unavailable; try again shortly")
 				return
@@ -147,6 +161,7 @@ func (rl *RateLimiter) Middleware(identity func(*http.Request) (string, bool)) f
 					secs = 1
 				}
 				w.Header().Set("Retry-After", strconv.Itoa(secs))
+				metrics.RateLimitRejections.WithLabelValues(rl.name, "limited").Inc()
 				writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 				return
 			}
@@ -166,4 +181,13 @@ func ByIP(r *http.Request) (string, bool) {
 		host = r.RemoteAddr
 	}
 	return "ip:" + host, host != ""
+}
+
+// limiterLabel keeps the metric label bounded even for unexpected prefixes.
+func limiterLabel(prefix string) string {
+	switch prefix {
+	case "user", "auth":
+		return prefix
+	}
+	return "other"
 }

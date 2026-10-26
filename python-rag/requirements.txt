@@ -24,3 +24,10 @@ numpy>=1.26,<2
 duckduckgo-search>=6.1.7,<9
 beautifulsoup4>=4.12,<5
 requests>=2.31,<3
+
+# Tracing (checkpoint 9). chromadb already pulls these api/sdk/instrumentation
+# versions; pinned here, plus the OTLP/HTTP exporter for Jaeger.
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-instrumentation-fastapi==0.66b1
+opentelemetry-exporter-otlp-proto-http==1.45.1

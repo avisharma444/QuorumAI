@@ -51,6 +51,11 @@ func (m *MockClient) GenerateChat(ctx context.Context, opts GenerateOptions) (*R
 	}
 	sys := strings.Join(system, "\n")
 	prompt := strings.Join(user, "\n")
+	// "#fail=<name>" in the question makes that mock model's requests fail
+	// (failure injection for observability checks; mock mode only).
+	if strings.Contains(prompt, "#fail="+m.Name) {
+		return nil, fmt.Errorf("mock failure injected for %s", m.ModelName())
+	}
 	return &Response{Answer: mockAnswer(m.ModelName(), sys, prompt), Model: m.ModelName()}, nil
 }
 
@@ -89,6 +94,7 @@ func mockRoute(prompt string) string {
 //	#reflect=invalid          malformed audit (exercises reflection failure)
 //	#revise=invalid           malformed revision (exercises revision failure)
 //	#chair=invalid            malformed chairman output (exercises the fallback)
+//	#fail=member-2            that mock model's requests fail (any mock name)
 //
 // Without directives the mock audit returns "good". It never reports a
 // confidence value.

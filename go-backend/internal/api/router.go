@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"context"
 	"errors"
 	"net/http"
@@ -16,7 +18,7 @@ import (
 
 // Routes builds the Chi router (reference internal/api/router.go).
 //
-// Public: /health, /metrics (JSON counters, no user data), /api/v1/register,
+// Public: /health, /api/v1/register,
 // /api/v1/login (rate-limited per client IP when AuthLimiter is set).
 // Protected (JWT, then per-user rate limit): query, ingest and conversation
 // endpoints. Unauthenticated requests are rejected before any cache, RAG
@@ -42,7 +44,6 @@ func (s *Server) Routes() http.Handler {
 	}
 
 	r.Get("/health", s.handleHealth)
-	r.Get("/metrics", s.handleMetrics)
 
 	r.Group(func(r chi.Router) {
 		if s.AuthLimiter != nil {
@@ -74,13 +75,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, body)
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	body := map[string]any{"requests": s.Requests.Load(), "exact_cache_hits": s.Hits.Load(), "semantic_cache_hits": s.L2Hits.Load(), "failures": s.Failures.Load()}
-	if s.Breaker != nil {
-		cs, cf, ts, tf := s.Breaker.Counts()
-		body["redis_breaker"] = map[string]any{"state": s.Breaker.State().String(), "consecutive_successes": cs, "consecutive_failures": cf, "total_successes": ts, "total_failures": tf}
-	}
-	respond(w, 200, body)
+// MetricsHandler serves the Prometheus exposition format (reference:
+// promhttp.Handler on /metrics). main.go serves it on a separate,
+// internal-only listener (METRICS_ADDR), not on the public API port.
+func MetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	return mux
 }
 
 func (s *Server) postgresHealth(ctx context.Context) string {

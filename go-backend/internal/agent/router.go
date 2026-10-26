@@ -111,7 +111,7 @@ func (r *Router) PlanWithDocument(ctx context.Context, question string, doc Docu
 		userMsg = fmt.Sprintf("Question: %s\nNo document attached.", question)
 	}
 
-	resp, err := r.client.GenerateChat(ctx, llm.GenerateOptions{
+	resp, err := llm.Call(ctx, "router", r.client, llm.GenerateOptions{
 		Messages: []llm.Message{
 			{Role: "system", Content: routerSystemPrompt},
 			{Role: "user", Content: userMsg},

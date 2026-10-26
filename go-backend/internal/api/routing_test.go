@@ -25,6 +25,7 @@ type fakeRAG struct {
 	*httptest.Server
 	mu             sync.Mutex
 	calls          map[string]int
+	traceparents   map[string]string // last traceparent header per path
 	ingestN        int
 	preview        string
 	retrieveStatus int
@@ -38,10 +39,11 @@ const okSearch = `{"status":"ok","results":["Source [1]: Mirevale\nURL: https://
 
 func newFakeRAG(t *testing.T) *fakeRAG {
 	t.Helper()
-	f := &fakeRAG{calls: map[string]int{}, preview: "Zogland facts. The capital of Zogland is Mirevale.", retrieveStatus: 200, searchStatus: 200, searchBody: okSearch}
+	f := &fakeRAG{calls: map[string]int{}, traceparents: map[string]string{}, preview: "Zogland facts. The capital of Zogland is Mirevale.", retrieveStatus: 200, searchStatus: 200, searchBody: okSearch}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.calls[r.URL.Path]++
+		f.traceparents[r.URL.Path] = r.Header.Get("traceparent")
 		f.mu.Unlock()
 		switch r.URL.Path {
 		case "/ingest":

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"example.com/councilai-starter/internal/metrics"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -74,6 +76,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	case err != nil:
 		slog.Error("registration failed", "error", err.Error())
+		metrics.DependencyErrors.WithLabelValues("postgres", "users").Inc()
 		respondError(w, http.StatusServiceUnavailable, "user database unavailable")
 		return
 	}
@@ -102,6 +105,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	case err != nil:
 		slog.Error("login lookup failed", "error", err.Error())
+		metrics.DependencyErrors.WithLabelValues("postgres", "users").Inc()
 		respondError(w, http.StatusServiceUnavailable, "user database unavailable")
 		return
 	}
@@ -145,6 +149,7 @@ func (s *Server) handleClearConversation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.Memory.Clear(r.Context(), userID, session); err != nil {
+		metrics.DependencyErrors.WithLabelValues("redis", "conversation").Inc()
 		respondError(w, http.StatusServiceUnavailable, "conversation memory unavailable")
 		return
 	}
@@ -160,6 +165,7 @@ func (s *Server) handleConversationHistory(w http.ResponseWriter, r *http.Reques
 	}
 	turns, err := s.Memory.GetHistory(r.Context(), userID, session, 0)
 	if err != nil {
+		metrics.DependencyErrors.WithLabelValues("redis", "conversation").Inc()
 		respondError(w, http.StatusServiceUnavailable, "conversation memory unavailable")
 		return
 	}

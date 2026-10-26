@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.models import Chunk, ChunkType
+from app.telemetry import span
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,8 @@ class ChromaStore:
         if not chunks:
             raise ValueError("No chunks to ingest")
         texts = [c.content for c in chunks]
-        vectors = self.embeddings.embed_documents(texts)  # before any store change
+        with span("rag.embed_documents", **{"rag.chunks": len(texts)}):
+            vectors = self.embeddings.embed_documents(texts)  # before any store change
         final = self.collection_name(doc_id)
         staging = f"{final}_s{uuid.uuid4().hex[:8]}"
         with self._lock(doc_id):
@@ -150,9 +152,11 @@ class ChromaStore:
             return RetrievalResult(chunks=[])
         fetch_k = min(top_k * 3, total)
         t0 = time.perf_counter()
-        query_vec = self.embeddings.embed_query(query)
+        with span("rag.embed_query"):
+            query_vec = self.embeddings.embed_query(query)
         t1 = time.perf_counter()
-        res = col.query(query_embeddings=[query_vec], n_results=fetch_k, include=["documents", "metadatas", "distances"])
+        with span("rag.vector_search", **{"rag.fetch_k": fetch_k, "rag.collection_size": total}):
+            res = col.query(query_embeddings=[query_vec], n_results=fetch_k, include=["documents", "metadatas", "distances"])
         t2 = time.perf_counter()
         candidates = []
         for rank, (text, meta, dist) in enumerate(zip(res["documents"][0], res["metadatas"][0], res["distances"][0])):
@@ -168,7 +172,8 @@ class ChromaStore:
             else:
                 t3 = time.perf_counter()
                 try:
-                    order = reranker.rerank(query, [c.content for c in candidates], top_k=top_k)
+                    with span("rag.rerank", **{"rag.candidates": len(candidates), "rag.top_k": top_k}):
+                        order = reranker.rerank(query, [c.content for c in candidates], top_k=top_k)
                     result.chunks = []
                     for idx, score in order:
                         chunk = candidates[idx]

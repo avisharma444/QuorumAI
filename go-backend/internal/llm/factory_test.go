@@ -1,6 +1,10 @@
 package llm
 
 import (
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"example.com/councilai-starter/internal/metrics"
+
 	"context"
 	"strings"
 	"testing"
@@ -118,5 +122,41 @@ func TestMockClient(t *testing.T) {
 	cancel()
 	if _, err := (&MockClient{Name: "x", Delay: time.Hour}).Generate(ctx, "hi"); err == nil {
 		t.Fatal("mock must honour cancellation")
+	}
+}
+
+func TestMockFailureDirectiveAndCallMetrics(t *testing.T) {
+	m := &MockClient{Name: "member-2"}
+	other := &MockClient{Name: "member-1"}
+	opts := GenerateOptions{Messages: []Message{{Role: "system", Content: "COUNCIL_MEMBER"}, {Role: "user", Content: "q #fail=member-2"}}}
+	fails := testutil.ToFloat64(metrics.LLMFailures.WithLabelValues("candidate", "mock"))
+	if _, err := Call(context.Background(), "candidate", m, opts); err == nil {
+		t.Fatal("directive ignored")
+	}
+	if _, err := Call(context.Background(), "candidate", other, opts); err != nil {
+		t.Fatal("other mock models must answer")
+	}
+	if testutil.ToFloat64(metrics.LLMFailures.WithLabelValues("candidate", "mock"))-fails != 1 {
+		t.Fatal("failure not counted exactly once")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := testutil.ToFloat64(metrics.LLMFailures.WithLabelValues("candidate", "mock"))
+	if _, err := Call(ctx, "candidate", other, opts); err == nil {
+		t.Fatal("cancelled call succeeded")
+	}
+	if testutil.ToFloat64(metrics.LLMFailures.WithLabelValues("candidate", "mock")) != before {
+		t.Fatal("a caller cancellation is not a model failure")
+	}
+	tokens := testutil.ToFloat64(metrics.LLMTokens.WithLabelValues("candidate", "mock", "prompt"))
+	_, _ = Call(context.Background(), "candidate", other, opts)
+	if testutil.ToFloat64(metrics.LLMTokens.WithLabelValues("candidate", "mock", "prompt")) != tokens {
+		t.Fatal("mock models report no usage: no tokens may be recorded")
+	}
+	for name, want := range map[string]string{"gemini:gemini-2.5-flash": "gemini", "openrouter/free": "openrouter", "nim:meta/llama": "nvidia-nim",
+		"local:phi": "local", "mock:member-1": "mock", "weird": "other", "x:y": "other"} {
+		if got := metrics.Provider(name); got != want {
+			t.Fatalf("%s -> %s", name, got)
+		}
 	}
 }

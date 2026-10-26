@@ -4,6 +4,9 @@
 package cache
 
 import (
+	"example.com/councilai-starter/internal/metrics"
+	"strings"
+
 	"context"
 	"errors"
 	"fmt"
@@ -157,6 +160,7 @@ func (cb *Breaker) Counts() (int, int, uint64, uint64) {
 func (cb *Breaker) setStateLocked(s State) {
 	if cb.state != s {
 		log.Printf("[CircuitBreaker %s] %s -> %s", cb.name, cb.state, s)
+		metrics.BreakerTransitions.WithLabelValues(cb.name, strings.ToLower(s.String())).Inc()
 	}
 	cb.state = s
 	cb.generation++

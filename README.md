@@ -6,7 +6,7 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 
 ## What works now
 
-- **Go 1.23 control plane:** public `POST /api/v1/register`, `POST /api/v1/login`, `GET /health`, `GET /metrics`; Bearer-token protected `POST /api/v1/query`, `POST /api/v1/ingest`, `POST /api/v1/conversation/history`, `POST /api/v1/conversation/clear`.
+- **Go 1.23 control plane:** public `POST /api/v1/register`, `POST /api/v1/login`, `GET /health`; Bearer-token protected `POST /api/v1/query`, `POST /api/v1/ingest`, `POST /api/v1/conversation/history`, `POST /api/v1/conversation/clear`.
 - **Authentication (PostgreSQL + JWT):** users in PostgreSQL 16 (bcrypt cost 12, UUID ids, versioned migrations under an advisory lock); HS256 JWTs (golang-jwt v5) that must carry issuer, expiry and issued-at and whose subject is the user UUID. The backend refuses to start without PostgreSQL or with a weak `JWT_SECRET`; there is no in-memory or "anonymous" fallback.
 - **Per-user data:** documents are visible only to users who uploaded them (`document_access` grants; another user's document and a missing one return the same 404). L1/L2 cache keys and scopes include the user. Conversation memory lives in Redis per user and session (last 10 exchanges, 24 h).
 - **Rate limiting:** Redis GCRA limiter (atomic Lua, Redis clock): 10 req/s burst 20 per user on protected routes, and 1 per 5 s burst 10 per client IP on register/login. 429 responses carry `Retry-After`.
@@ -15,14 +15,15 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 - **Python FastAPI RAG service (reference architecture):** document inspection → adaptive extraction (PyPDF2 text layer, pdfplumber layout/tables, Tesseract OCR for images and scanned PDFs) → layout-aware chunks (tables kept whole, headings attached, captions grouped) → `BAAI/bge-small-en-v1.5` embeddings (mean pooling, 384-D, CPU) → persistent **ChromaDB** collection per document → `cross-encoder/ms-marco-MiniLM-L-6-v2` reranking of 3×k vector candidates. Endpoints: `/ingest`, `/retrieve`, `/retrieve-all`, `/embed`, `/search`, `/health` (liveness), `/ready` (models loaded).
 - **Persistence:** Chroma data in the `chroma-data` volume; model weights in the `councilai-hf` volume (downloaded once). Re-uploading identical bytes replaces that document atomically.
 - **Redis Stack caching (reference architecture):** L1 exact cache (JSON in Redis, 1 h TTL, hashed versioned keys), L2 semantic cache (RediSearch FLAT/COSINE/FLOAT32 384-D index `idx:semantic_cache`, KNN `FT.SEARCH`, 24 h TTL, threshold 0.85; **answer reuse off by default**, see below) and document summaries (`councilai:v4:doc_summary:<id>`), all behind one circuit breaker (3 failures → open, 10 s cooldown, 1 half-open probe, 2 successes → closed). Caching is an optimisation: when Redis is down nothing is cached in-process. Rate limiting fails **closed** by default (503 while Redis is unreachable, so model spending is never unmetered); `RATE_LIMIT_FAILURE_POLICY=open` restores the reference behaviour.
+- **Observability:** Prometheus metrics (`client_golang`) on an internal-only port, Grafana dashboard (22 panels, provisioned), OpenTelemetry tracing in Go and Python with W3C `traceparent` propagation and an optional Jaeger backend, and k6 load-test profiles. See [Observability](#observability) and [docs/performance.md](docs/performance.md).
 - **Streamlit UI:** register/login/logout, conversation sessions with history and clear, document upload, model stages, candidate/review inspection.
 - **Safe default testing:** `MOCK_LLM=true` runs without model API keys, using clearly identified mock answers.
 - **Tests:** Go unit tests (including parallel execution and SSE), Python ingestion/retrieval tests, an HTTP latency benchmark, and a real two-service smoke-test script.
 
 ### Deliberately NOT implemented yet
 
-- Prometheus/Grafana/OpenTelemetry instrumentation (the current `/metrics` is a JSON counter endpoint)
-- Calibrated confidence scores, quality improvement claims, performance claims, or load-test evidence
+- Calibrated confidence scores, quality improvement claims, or real-model performance numbers (load tests so far use mock models)
+- Alerting rules, log aggregation, metrics for the Python service (it is traced, not scraped)
 - Roles/admin users, document sharing between users, deleting documents, token revocation (tokens stay valid until they expire), password reset
 - Documents uploaded before authentication existed have no owner and are therefore not reachable through the API
 - Provider retries/rate budgets, production deployment and hardening
@@ -143,8 +144,8 @@ curl -N -X POST http://localhost:8080/api/v1/query -H "Authorization: Bearer $TO
 - **CORS** is off by default. `CORS_ALLOWED_ORIGINS` takes an explicit
   comma-separated list; `*` is rejected. Credentials are never allowed (the
   API uses Bearer headers, not cookies).
-- **Logs** record method, path, status, latency, request ID and user UUID;
-  never headers, bodies, query strings, tokens or passwords.
+- **Logs** record method, route pattern, status, latency, request ID, trace
+  ID and user UUID; never headers, bodies, query strings, tokens or passwords.
 
 ### How a query is routed
 
@@ -245,6 +246,64 @@ include provider-reported token usage per call and in total (`token_usage`).
   reuse). With authentication on, the end-to-end benchmark reproduced the
   same 52% / 28% rates.
 
+## Observability
+
+Metrics and tracing are always compiled in; the heavier pieces are optional
+Compose profiles so the normal stack stays small:
+
+```bash
+# Prometheus (127.0.0.1:9091) + Grafana (127.0.0.1:3000). Set GRAFANA_ADMIN_PASSWORD in .env first.
+docker compose --profile observability up -d
+# Add Jaeger (127.0.0.1:16686) and export traces from Go and Python over OTLP/HTTP:
+OTEL_TRACES_EXPORTER=otlp docker compose --profile observability --profile tracing up -d
+```
+
+- **Metrics** (`go-backend/internal/metrics`): the reference's six families
+  (`councilai_request_count_total`, `councilai_request_latency_seconds`,
+  `councilai_chairman_synthesis_count_total`, `councilai_llm_failure_count_total`,
+  `councilai_cache_operations_total`, `councilai_council_response_seconds`) plus
+  stage, model-request, token, router, cache-lookup/-write, circuit-breaker,
+  RAG, dependency-error, rate-limit, conversation, in-flight and disconnect
+  metrics. Labels are bounded: route *patterns* (`unmatched` for anything
+  else), stage, provider family, result, level, strategy. No user, document
+  or session IDs, questions, model names or raw paths.
+  `/metrics` is served by promhttp on `METRICS_ADDR` (`:9464`), which is not
+  published to the host; Prometheus scrapes it every 15 s. The public API
+  port answers `/metrics` with 404.
+- **Corrected reference behaviour:** the chairman counter is incremented
+  (the reference declared but never incremented it); council time is observed
+  once per run (the reference observed it twice); model failures of every
+  stage are counted (not only candidates), timeouts count as failures and
+  client cancellations do not; quantile panels aggregate `sum by (le)`.
+- **Tracing** (`go-backend/internal/telemetry`, `python-rag/app/telemetry.py`):
+  exporters `noop` (default), `stdout`, `otlp`; parent-based sampling
+  (`OTEL_TRACES_SAMPLER_ARG`). One trace per request: `POST /api/v1/query` →
+  rate-limit check, document access, L1 lookup, router, L2 lookup (embed),
+  `rag POST /retrieve` → Python `POST /retrieve` → embed / vector search /
+  rerank, `council.run` → candidates (one span per model, concurrent
+  siblings) → peer review → chairman → reflection → revision, cache store,
+  conversation save. Only stages that ran produce spans. Responses carry
+  `X-Trace-ID`. Span attributes hold categories, counts and timings only:
+  never questions, answers, document text, user IDs or tokens. Export runs
+  in a background batch; an unreachable collector is logged (rate-limited)
+  and counted in `councilai_telemetry_errors_total` without affecting
+  requests. Python tracing is an extension: the reference traced Go only.
+- **Grafana** uses the provisioned `Prometheus` data source and the
+  `CouncilAI` dashboard (`monitoring/grafana/dashboards/councilai.json`,
+  generated by `monitoring/build_dashboard.py`). There is no default
+  password: Grafana refuses to start without `GRAFANA_ADMIN_PASSWORD`.
+- **Load tests** (`tests/load/load_test.js`, k6): profiles `reference`
+  (the original 0→5→20→0 VU stages), `cold`, `l1`, `l2` (needs
+  `SEMANTIC_CACHE_ENABLED=true`), `direct`, `council`, `deep`, `multiuser`
+  and `ratelimit`. Each run registers its own users with random credentials
+  and uploads `tests/load/corpus.md`; rate limiting stays on and 429s are
+  reported separately. Results: [docs/performance.md](docs/performance.md).
+
+  ```bash
+  docker run --rm --network councilai-reproduced_default -v "$PWD/tests/load:/scripts" \
+    -e PROFILE=reference grafana/k6:0.54.0 run /scripts/load_test.js
+  ```
+
 ### Tests and benchmarks
 
 ```bash
@@ -281,7 +340,7 @@ N=20 python benchmarks/benchmark_http.py
 
 1. **Phase 2: Actual semantic RAG.** Implement persistent ChromaDB + local MiniLM embeddings; evaluate recall@k/MRR and exact document-grounding failures against the lexical baseline.
 2. **Phase 3: Shared caching.** Go Redis client, L1 exact + Redis Stack RediSearch VSS cache, document-scope isolation, circuit breaker, meaningful p50/p95 cache metrics.
-3. **Phase 4: Hardening.** Auth, per-user document ownership, conversation memory and rate limiting are done; remaining: retries with bounded budgets, token revocation, traces and Prometheus metrics, load test.
+3. **Phase 4: Hardening.** Auth, per-user document ownership, conversation memory, rate limiting, metrics, tracing and mock-model load tests are done; remaining: retries with bounded budgets, token revocation, alerting, real-model load tests.
 4. **Phase 5: Model-quality experiment.** Curate held-out document questions, use identical retrieved evidence for single-model vs council, score with manual/source-grounded rubric and report cost/latency/accuracy tradeoffs.
 
 See [BUILD_PLAN.md](BUILD_PLAN.md) for measurable acceptance criteria.

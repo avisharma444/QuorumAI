@@ -101,3 +101,14 @@ council:
     stage: "30s"    # per model call inside a stage
     llm: "120s"     # HTTP client timeout for council members
     request: "120s" # whole query
+
+# Observability. Prometheus metrics are served on an internal-only listener
+# (not the public API port); tracing exports nothing unless enabled.
+# Environment overrides: METRICS_ADDR, OTEL_TRACES_EXPORTER (noop | stdout |
+# otlp), OTEL_EXPORTER_OTLP_ENDPOINT (e.g. jaeger:4318), OTEL_TRACES_SAMPLER_ARG.
+observability:
+  metrics_addr: ":9464"
+  tracing:
+    exporter: "noop"
+    otlp_endpoint: ""
+    sample_ratio: 1.0   # of new root traces; sampled incoming parents are always followed

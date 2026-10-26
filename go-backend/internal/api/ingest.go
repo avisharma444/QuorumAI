@@ -1,6 +1,8 @@
 package api
 
 import (
+	"example.com/councilai-starter/internal/metrics"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -77,15 +79,18 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("Content-Type", contentType)
+	req, done := startRAG(r.Context(), "/ingest", req)
 	// Ingestion runs OCR and embeddings, so it gets the request timeout
 	// rather than the short client timeout used for retrieval.
 	res, err := (&http.Client{Timeout: s.RequestTimeout, Transport: s.HTTP.Transport}).Do(req)
 	if err != nil {
+		done(0, err)
 		respondError(w, 502, "RAG service unavailable: "+err.Error())
 		return
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	done(res.StatusCode, err)
 	if err != nil {
 		respondError(w, 502, "failed to read ingestion response")
 		return
@@ -117,6 +122,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Docs.GrantDocument(r.Context(), auth.DocumentGrant{UserID: userID, DocID: docID, Filename: header.Filename, ChunkCount: int(chunks), OCRMethod: method}); err != nil {
+		metrics.DependencyErrors.WithLabelValues("postgres", "grant_document").Inc()
 		log.Printf("[Ingest] access grant failed for doc %s: %v", docID, err)
 		respondError(w, http.StatusServiceUnavailable, "document was processed but access could not be recorded; please retry the upload")
 		return

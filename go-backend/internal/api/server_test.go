@@ -1,6 +1,10 @@
 package api
 
 import (
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"example.com/councilai-starter/internal/metrics"
+
 	"bufio"
 	"encoding/json"
 	"errors"
@@ -166,9 +170,10 @@ func TestHTTPCaching(t *testing.T) {
 	srv := newTestServer(testCouncil(f), "http://unused.invalid")
 	body := `{"question":"Compare concurrency and parallelism","strategy":"council"}`
 	var first, second council.QueryResult
+	hits := testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("l1_exact", "hit"))
 	_ = json.Unmarshal(postQuery(t, srv, body, false).Body.Bytes(), &first)
 	_ = json.Unmarshal(postQuery(t, srv, body, false).Body.Bytes(), &second)
-	if first.CacheHit || !second.CacheHit || srv.Hits.Load() != 1 {
+	if first.CacheHit || !second.CacheHit || testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("l1_exact", "hit"))-hits != 1 {
 		t.Fatal("second identical request must be an exact cache hit")
 	}
 	if f.Count("member") != 3 || f.Count("review") != 3 {

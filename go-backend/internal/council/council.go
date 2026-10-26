@@ -13,6 +13,10 @@ import (
 	"time"
 
 	"example.com/councilai-starter/internal/llm"
+	"example.com/councilai-starter/internal/metrics"
+	"example.com/councilai-starter/internal/telemetry"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type QueryRequest struct {
@@ -321,7 +325,7 @@ type historyKey struct{}
 
 // call sends one system + user conversation with the per-stage timeout.
 // tune, if non-nil, adjusts the options (temperature, JSON mode, search).
-func (c *Council) call(ctx context.Context, client llm.LLMClient, system, user string, tune func(*llm.GenerateOptions)) (*llm.Response, error) {
+func (c *Council) call(ctx context.Context, stage string, client llm.LLMClient, system, user string, tune func(*llm.GenerateOptions)) (*llm.Response, error) {
 	timeout := c.StageTimeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
@@ -335,7 +339,7 @@ func (c *Council) call(ctx context.Context, client llm.LLMClient, system, user s
 	if tune != nil {
 		tune(&opts)
 	}
-	resp, err := client.GenerateChat(child, opts)
+	resp, err := llm.Call(child, stage, client, opts)
 	if err == nil && resp == nil {
 		err = errors.New("provider returned no response")
 	}
@@ -371,9 +375,24 @@ func addUsage(total **llm.Usage, u *llm.Usage) {
 	(*total).TotalTokens += u.TotalTokens
 }
 
+// beginStage opens span "council.<name>" and returns a function that ends
+// it and records the stage's wall time. Only stages that actually run call it.
+func beginStage(ctx context.Context, name string) (context.Context, func(outcome string)) {
+	ctx, span := telemetry.Start(ctx, "council."+name)
+	start := time.Now()
+	return ctx, func(outcome string) {
+		metrics.StageDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
+		span.SetAttributes(attribute.String("council.stage_outcome", outcome))
+		if outcome != "ok" {
+			telemetry.Fail(span, outcome)
+		}
+		span.End()
+	}
+}
+
 // Run executes q.Strategy ("direct", "council" or "council_deep") with the
 // given evidence.
-func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit EventFn) (QueryResult, error) {
+func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit EventFn) (_ QueryResult, runErr error) {
 	sources := ev.Passages
 	if emit == nil {
 		emit = func(string, any) {}
@@ -383,9 +402,24 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 	if !ValidStrategy(strategy) {
 		return QueryResult{}, fmt.Errorf("unknown strategy %q", strategy)
 	}
+	ctx, runSpan := telemetry.Start(ctx, "council.run", attribute.String("council.strategy", strategy),
+		attribute.Int("council.members", len(c.Members)), attribute.Int("council.evidence_passages", len(sources)))
+	defer func() {
+		switch {
+		case runErr == nil:
+		case ctx.Err() != nil:
+			telemetry.Fail(runSpan, "cancelled")
+		default:
+			telemetry.Fail(runSpan, "council_failed")
+		}
+		runSpan.End()
+	}()
 	result := QueryResult{Strategy: strategy, Sources: sources, Grounding: ev.kind(), ConfidenceNote: "No calibrated probability: model judgments must be benchmarked."}
 	finish := func() (QueryResult, error) {
 		result.DurationMS = time.Since(started).Milliseconds()
+		metrics.CouncilResponse.WithLabelValues(strategy).Observe(time.Since(started).Seconds())
+		runSpan.SetAttributes(attribute.String("council.source_kind", sourceKind(result.Source)),
+			attribute.StringSlice("council.degraded", result.Degraded))
 		emit("final", result)
 		return result, nil
 	}
@@ -402,10 +436,13 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 	prompt := promptFor(q.Question, ev)
 	if strategy == "direct" {
 		dctx := context.WithValue(ctx, historyKey{}, historyMessages(q.History))
-		resp, err := c.call(dctx, c.Chairman, directSystem, prompt, searchFor(c.Chairman, sources))
+		dctx, end := beginStage(dctx, "direct")
+		resp, err := c.call(dctx, "direct", c.Chairman, directSystem, prompt, searchFor(c.Chairman, sources))
 		if err != nil {
+			end("failed")
 			return result, err
 		}
+		end("ok")
 		addUsage(&result.TokenUsage, reported(resp))
 		result.Answer = resp.Answer
 		result.Source = "direct:" + c.Chairman.ModelName()
@@ -459,8 +496,16 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 
 	// Stage 3: structured chairman synthesis from candidates plus valid reviews.
 	chairModel := c.Chairman.ModelName()
-	cr, usage, err := c.chairmanSynthesize(ctx, q.Question, ev, result.Candidates, result.Reviews)
+	cctx, endChair := beginStage(ctx, "chairman")
+	cr, usage, err := c.chairmanSynthesize(cctx, q.Question, ev, result.Candidates, result.Reviews)
 	addUsage(&result.TokenUsage, usage)
+	if err != nil {
+		metrics.ChairmanSynthesis.WithLabelValues("failure").Inc()
+		endChair("failed")
+	} else {
+		metrics.ChairmanSynthesis.WithLabelValues("success").Inc()
+		endChair("ok")
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, ctxErr
@@ -485,14 +530,16 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 }
 
 func (c *Council) generateCandidates(ctx context.Context, prompt string, sources []string, emit EventFn) []Candidate {
+	ctx, end := beginStage(ctx, "candidates")
 	out := make([]Candidate, len(c.Members))
+	defer func() { end(stageOutcome(countCandidateFailures(out), len(out))) }()
 	var wg sync.WaitGroup
 	for i, member := range c.Members {
 		wg.Add(1)
 		go func(i int, member llm.LLMClient) {
 			defer wg.Done()
 			start := time.Now()
-			resp, err := c.call(ctx, member, memberSystem, prompt, searchFor(member, sources))
+			resp, err := c.call(ctx, "candidate", member, memberSystem, prompt, searchFor(member, sources))
 			cand := Candidate{Model: member.ModelName(), LatencyMS: time.Since(start).Milliseconds()}
 			if err != nil {
 				cand.Error = err.Error()
@@ -511,15 +558,25 @@ func (c *Council) generateCandidates(ctx context.Context, prompt string, sources
 }
 
 func (c *Council) peerReview(ctx context.Context, question string, cands []Candidate, emit EventFn) []Review {
+	ctx, end := beginStage(ctx, "peer_review")
 	prompt := reviewPrompt(question, cands)
 	reviews := make([]Review, len(c.Members))
+	defer func() {
+		failed := 0
+		for _, r := range reviews {
+			if r.Error != "" {
+				failed++
+			}
+		}
+		end(stageOutcome(failed, len(reviews)))
+	}()
 	var wg sync.WaitGroup
 	for i, member := range c.Members {
 		wg.Add(1)
 		go func(i int, member llm.LLMClient) {
 			defer wg.Done()
 			start := time.Now()
-			resp, err := c.call(ctx, member, reviewSystem, prompt, nil)
+			resp, err := c.call(ctx, "review", member, reviewSystem, prompt, nil)
 			r := Review{Index: i, Reviewer: member.ModelName(), LatencyMS: time.Since(start).Milliseconds()}
 			if err != nil {
 				r.Error = "review request failed: " + err.Error()
@@ -563,8 +620,14 @@ func (c *Council) deepReflection(ctx context.Context, question string, ev Eviden
 	model := c.Chairman.ModelName()
 	info := &ReflectionInfo{Model: model}
 	result.Reflection = info
-	r, usage, err := c.reflectOn(ctx, question, ev, result.Answer)
+	rctx, endReflect := beginStage(ctx, "reflection")
+	r, usage, err := c.reflectOn(rctx, question, ev, result.Answer)
 	addUsage(&result.TokenUsage, usage)
+	if err != nil {
+		endReflect("failed")
+	} else {
+		endReflect("ok")
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -594,8 +657,14 @@ func (c *Council) deepReflection(ctx context.Context, question string, ev Eviden
 	}
 	rev := &RevisionInfo{PreviousAnswer: result.Answer, PreviousSource: result.Source}
 	info.Revision = rev
-	revised, usage, err := c.reviseAnswer(ctx, question, ev, result.Answer, *r)
+	vctx, endRevise := beginStage(ctx, "revision")
+	revised, usage, err := c.reviseAnswer(vctx, question, ev, result.Answer, *r)
 	addUsage(&result.TokenUsage, usage)
+	if err != nil {
+		endRevise("failed")
+	} else {
+		endRevise("ok")
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -774,4 +843,41 @@ func sortedModels(candidates []Candidate) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// stageOutcome summarizes a fan-out: ok, partial (some failed) or failed.
+func stageOutcome(failed, total int) string {
+	switch {
+	case failed == 0:
+		return "ok"
+	case failed < total:
+		return "partial"
+	}
+	return "failed"
+}
+
+func countCandidateFailures(cands []Candidate) int {
+	n := 0
+	for _, c := range cands {
+		if c.Error != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// sourceKind reduces result.Source ("chairman:<model>", "<model> (fallback)")
+// to a model-free category for span attributes.
+func sourceKind(source string) string {
+	switch {
+	case strings.HasPrefix(source, "chairman-revised:"):
+		return "chairman_revised"
+	case strings.HasPrefix(source, "chairman:"):
+		return "chairman"
+	case strings.HasPrefix(source, "direct:"):
+		return "direct"
+	case strings.Contains(source, "fallback"), strings.Contains(source, "single-response"):
+		return "fallback"
+	}
+	return "other"
 }

@@ -10,6 +10,11 @@ services:
       - chroma-data:/data/chroma_db
       - hf-models:/models
       - ./config.yaml:/app/config.yaml:ro
+    environment:
+      # Tracing is off unless OTEL_TRACES_EXPORTER=otlp (see the tracing profile).
+      - OTEL_TRACES_EXPORTER=${OTEL_TRACES_EXPORTER:-none}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      - OTEL_TRACES_SAMPLER_ARG=${OTEL_TRACES_SAMPLER_ARG:-1.0}
     # Ready only after the embedding model, reranker and Chroma store load
     # (the first start downloads the weights into hf-models).
     healthcheck:
@@ -79,6 +84,10 @@ services:
       - DB_NAME=${POSTGRES_DB:-councilai}
       - DB_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       - SEMANTIC_CACHE_ENABLED=${SEMANTIC_CACHE_ENABLED:-false}
+      - METRICS_ADDR=:9464   # Prometheus endpoint, internal network only (no host port)
+      - OTEL_TRACES_EXPORTER=${OTEL_TRACES_EXPORTER:-none}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      - OTEL_TRACES_SAMPLER_ARG=${OTEL_TRACES_SAMPLER_ARG:-1.0}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     depends_on:
@@ -98,10 +107,69 @@ services:
     depends_on:
       - go-backend
 
+  # ── Observability (optional): docker compose --profile observability up -d
+  # Prometheus scrapes go-backend:9464 every 15 s. UI on 127.0.0.1:9091 only.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=512MB
+    ports:
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    mem_limit: 256m
+    depends_on:
+      - go-backend
+
+  # Grafana with the provisioned Prometheus data source and CouncilAI
+  # dashboard. Admin password from .env (GRAFANA_ADMIN_PASSWORD); Grafana
+  # refuses to start without it instead of falling back to admin/admin.
+  grafana:
+    image: grafana/grafana:11.2.2
+    profiles: ["observability"]
+    entrypoint: ["sh", "-c", "[ -n \"$$GF_SECURITY_ADMIN_PASSWORD\" ] || { echo 'GRAFANA_ADMIN_PASSWORD is not set in .env' >&2; exit 1; }; exec /run.sh"]
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-councilai-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/councilai.json
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    mem_limit: 256m
+    depends_on:
+      - prometheus
+
+  # ── Tracing (optional): OTEL_TRACES_EXPORTER=otlp docker compose --profile tracing up -d
+  # Jaeger all-in-one receives OTLP/HTTP on 4318 (internal) and keeps traces
+  # in memory (bounded). UI on 127.0.0.1:16686 only.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["tracing"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - MEMORY_MAX_TRACES=5000
+    ports:
+      - "127.0.0.1:16686:16686"
+    mem_limit: 256m
+
 volumes:
   chroma-data:
   redis-data:
   postgres-data:
+  prometheus-data:
+  grafana-data:
   # Shared with the test image so model weights are downloaded only once.
   hf-models:
     name: councilai-hf

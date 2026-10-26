@@ -167,7 +167,11 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
                 if not r.ok:
                     raise ValueError(explain(r))
                 event_type = ""
-                for line in r.iter_lines(decode_unicode=True):
+                # Split on bytes (only \n / \r), then decode: str.splitlines()
+                # would also split on U+0085 and similar characters, which can
+                # appear raw inside JSON strings (e.g. web-search text).
+                for raw_line in r.iter_lines():
+                    line = raw_line.decode("utf-8")
                     if not line:
                         continue
                     if line.startswith("event: "):
@@ -322,9 +326,9 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
     except (requests.RequestException, ValueError) as exc:
         st.error(f"Request failed: {exc}")
 
-with st.expander("Backend metrics"):
+with st.expander("Backend health"):
+    # Prometheus metrics are internal-only; see Grafana (observability profile).
     try:
-        metrics = requests.get(f"{API}/metrics", timeout=3).json()
-        st.json(metrics)
+        st.json(requests.get(f"{API}/health", timeout=3).json())
     except requests.RequestException:
         st.caption("Backend unavailable")

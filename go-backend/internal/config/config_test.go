@@ -266,3 +266,36 @@ func TestSecretsAreNotAcceptedFromYAML(t *testing.T) {
 		}
 	}
 }
+
+func TestObservabilityConfig(t *testing.T) {
+	cfg, err := LoadFrom(repoConfig, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob := cfg.Observability
+	if ob.MetricsAddr != ":9464" || ob.TraceExporter != "noop" || ob.SampleRatio != 1 || ob.OTLPEndpoint != "" {
+		t.Fatalf("defaults %+v", ob)
+	}
+	cfg, err = LoadFrom(repoConfig, env(map[string]string{
+		"OTEL_TRACES_EXPORTER": "OTLP", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://jaeger:4318", "OTEL_TRACES_SAMPLER_ARG": "0.25", "METRICS_ADDR": ":9999"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob = cfg.Observability
+	if ob.TraceExporter != "otlp" || ob.OTLPEndpoint != "jaeger:4318" || ob.SampleRatio != 0.25 || ob.MetricsAddr != ":9999" {
+		t.Fatalf("overrides %+v", ob)
+	}
+	if cfg, err := LoadFrom(repoConfig, env(map[string]string{"OTEL_TRACES_EXPORTER": "none"})); err != nil || cfg.Observability.TraceExporter != "noop" {
+		t.Fatal("none must mean noop (OpenTelemetry convention)")
+	}
+	for name, vars := range map[string]map[string]string{
+		"otlp without endpoint": {"OTEL_TRACES_EXPORTER": "otlp"},
+		"unknown exporter":      {"OTEL_TRACES_EXPORTER": "zipkin"},
+		"ratio 0":               {"OTEL_TRACES_SAMPLER_ARG": "0"},
+		"ratio > 1":             {"OTEL_TRACES_SAMPLER_ARG": "1.5"},
+	} {
+		if _, err := LoadFrom(repoConfig, env(vars)); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}

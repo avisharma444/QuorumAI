@@ -19,6 +19,7 @@ from app.ocr.router import route_ocr
 from app.sampling import bme_preview
 from app.services import RagServices, ServiceUnavailable
 from app.state import get_services
+from app.telemetry import span
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -55,8 +56,11 @@ def ingest_document(file: UploadFile = File(...), doc_id: Optional[str] = None, 
 
     started = time.perf_counter()
     try:
-        metadata = inspect_document(raw, filename)
-        ocr = route_ocr(raw, filename, metadata, svc.tesseract)
+        with span("rag.inspect", **{"rag.bytes": len(raw)}):
+            metadata = inspect_document(raw, filename)
+        with span("rag.extract") as sp:
+            ocr = route_ocr(raw, filename, metadata, svc.tesseract)
+            sp.set_attribute("rag.ocr_method", str(ocr.ocr_method))
     except NoTextExtracted as exc:
         raise HTTPException(422, str(exc)) from exc
     except DocumentError as exc:
@@ -64,12 +68,15 @@ def ingest_document(file: UploadFile = File(...), doc_id: Optional[str] = None, 
     except ExtractionError as exc:
         logger.exception("Extraction failed for %s", filename)
         raise HTTPException(500, str(exc)) from exc
-    chunks = chunk_document(ocr)
+    with span("rag.chunk") as sp:
+        chunks = chunk_document(ocr)
+        sp.set_attribute("rag.chunks", len(chunks))
     if not chunks:
         raise HTTPException(422, "No text could be extracted from the document")
     preview = bme_preview([c.content for c in chunks])
     try:
-        count, replaced = store.ingest(chunks, doc_id)
+        with span("rag.store"):
+            count, replaced = store.ingest(chunks, doc_id)
     except Exception as exc:
         logger.exception("Embedding/storage failed for %s", doc_id)
         raise HTTPException(500, f"Embedding or storage failed: {type(exc).__name__}: {exc}") from exc

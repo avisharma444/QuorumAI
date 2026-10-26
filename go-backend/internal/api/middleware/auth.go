@@ -3,6 +3,9 @@
 package middleware
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"context"
 	"encoding/json"
 	"net/http"
@@ -61,22 +64,31 @@ func Auth(jwtManager *auth.JWTManager) func(http.Handler) http.Handler {
 			header := r.Header.Get("Authorization")
 			if header == "" {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="councilai"`)
+				authFailed(r, "missing_token")
 				writeJSONError(w, http.StatusUnauthorized, "missing authorization header")
 				return
 			}
 			token, ok := BearerToken(header)
 			if !ok {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="councilai", error="invalid_request"`)
+				authFailed(r, "malformed_header")
 				writeJSONError(w, http.StatusUnauthorized, "invalid authorization header")
 				return
 			}
 			claims, err := jwtManager.ValidateToken(token)
 			if err != nil {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="councilai", error="invalid_token"`)
+				authFailed(r, "invalid_token")
 				writeJSONError(w, http.StatusUnauthorized, "invalid or expired token")
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(WithUserID(r.Context(), claims.UserID)))
 		})
 	}
+}
+
+// authFailed labels the request span with a fixed category; the token and
+// the validation error text are never recorded.
+func authFailed(r *http.Request, category string) {
+	trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("auth.failure", category))
 }

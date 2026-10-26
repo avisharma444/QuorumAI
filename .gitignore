@@ -28,3 +28,7 @@ chroma_db/
 models/
 benchmarks/results/
 python-rag/benchmarks/results/
+
+# k6 raw results (generated; summaries are in docs/)
+tests/load/results/*
+!tests/load/results/.gitkeep

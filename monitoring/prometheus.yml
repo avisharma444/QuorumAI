@@ -1,0 +1,15 @@
+# Prometheus configuration (reference: monitoring/prometheus.yml).
+# The Go backend serves metrics on an internal-only port (METRICS_ADDR,
+# default :9464); it is not published to the host.
+global:
+  scrape_interval: 15s       # reference value
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "go-backend"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["go-backend:9464"]
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

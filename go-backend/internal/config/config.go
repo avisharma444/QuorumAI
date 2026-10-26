@@ -42,6 +42,8 @@ type Config struct {
 	Conversation ConversationConfig
 	CORSOrigins  []string // explicit browser origins; empty = CORS off
 
+	Observability ObservabilityConfig
+
 	OpenRouterAPIKey string
 	OpenRouterURL    string
 	GeminiAPIKey     string
@@ -59,6 +61,14 @@ type Config struct {
 	StageTimeout   time.Duration // per model call inside a council stage
 	LLMTimeout     time.Duration // HTTP client timeout for council members
 	RequestTimeout time.Duration // whole query
+}
+
+// ObservabilityConfig: Prometheus endpoint and OpenTelemetry tracing.
+type ObservabilityConfig struct {
+	MetricsAddr   string  // internal listener for /metrics ("" disables)
+	TraceExporter string  // noop (default), stdout, otlp
+	OTLPEndpoint  string  // host:port of an OTLP/HTTP receiver (e.g. jaeger:4318)
+	SampleRatio   float64 // of new root traces (incoming sampled parents are always followed)
 }
 
 // AuthConfig holds JWT and account settings. Secrets come only from the
@@ -162,6 +172,14 @@ type yamlSchema struct {
 		ConnMaxLifetime string `yaml:"conn_max_lifetime"`
 		ConnMaxIdleTime string `yaml:"conn_max_idle_time"`
 	} `yaml:"database"`
+	Observability struct {
+		MetricsAddr string `yaml:"metrics_addr"`
+		Tracing     struct {
+			Exporter     string  `yaml:"exporter"`
+			OTLPEndpoint string  `yaml:"otlp_endpoint"`
+			SampleRatio  float64 `yaml:"sample_ratio"`
+		} `yaml:"tracing"`
+	} `yaml:"observability"`
 	Conversation struct {
 		MaxTurns         int    `yaml:"max_turns"`
 		TTL              string `yaml:"ttl"`
@@ -394,6 +412,25 @@ func LoadFrom(path string, getenv func(string) string) (*Config, error) {
 	cv.HistoryExchanges = l.integer("CONVERSATION_HISTORY_EXCHANGES", y.Conversation.HistoryExchanges, 5)
 	if cv.MaxTurns < 1 || cv.HistoryExchanges < 0 || cv.HistoryExchanges > cv.MaxTurns {
 		l.fail("conversation: max_turns >= 1 and 0 <= history_exchanges <= max_turns")
+	}
+
+	ob := &cfg.Observability
+	ob.MetricsAddr = l.str("METRICS_ADDR", y.Observability.MetricsAddr, ":9464")
+	ob.TraceExporter = strings.ToLower(l.str("OTEL_TRACES_EXPORTER", y.Observability.Tracing.Exporter, "noop"))
+	switch ob.TraceExporter {
+	case "none":
+		ob.TraceExporter = "noop"
+	case "noop", "stdout", "otlp":
+	default:
+		l.fail("OTEL_TRACES_EXPORTER must be noop, stdout or otlp, got %q", ob.TraceExporter)
+	}
+	ob.OTLPEndpoint = strings.TrimPrefix(strings.TrimPrefix(l.str("OTEL_EXPORTER_OTLP_ENDPOINT", y.Observability.Tracing.OTLPEndpoint, ""), "http://"), "https://")
+	if ob.TraceExporter == "otlp" && ob.OTLPEndpoint == "" {
+		l.fail("OTEL_TRACES_EXPORTER=otlp needs OTEL_EXPORTER_OTLP_ENDPOINT (host:port)")
+	}
+	ob.SampleRatio = l.float("OTEL_TRACES_SAMPLER_ARG", y.Observability.Tracing.SampleRatio, 1.0)
+	if ob.SampleRatio <= 0 || ob.SampleRatio > 1 {
+		l.fail("OTEL_TRACES_SAMPLER_ARG must be in (0, 1], got %v", ob.SampleRatio)
 	}
 
 	cfg.CORSOrigins = y.Server.CORSAllowedOrigins

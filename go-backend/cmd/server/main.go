@@ -2,6 +2,9 @@
 package main
 
 import (
+	"example.com/councilai-starter/internal/metrics"
+	"example.com/councilai-starter/internal/telemetry"
+
 	"context"
 	"errors"
 	"fmt"
@@ -193,6 +196,49 @@ func connectPostgres(cfg *config.Config) (*auth.PostgresUserRepository, error) {
 	return repo, nil
 }
 
+// initTracer configures OpenTelemetry (reference: initTracer, which
+// hard-coded the noop exporter). Tracing problems never stop the server:
+// an invalid setup falls back to noop with a warning, and export errors
+// are logged (rate-limited) and counted in councilai_telemetry_errors_total.
+func initTracer(cfg *config.Config) *telemetry.Tracer {
+	telemetry.InstallErrorHandler(metrics.TelemetryExportErrors.Inc, 30*time.Second)
+	ob := cfg.Observability
+	tc := telemetry.Config{ServiceName: telemetry.InstrumentationName, ServiceVersion: "2.0.0", Environment: cfg.Auth.AppEnv,
+		ExporterType: telemetry.ExporterType(ob.TraceExporter), SampleRatio: ob.SampleRatio,
+		OTLPEndpoint: ob.OTLPEndpoint, OTLPInsecure: true}
+	t, err := telemetry.NewTracerProvider(tc)
+	if err != nil {
+		log.Printf("[Telemetry] WARNING: tracing disabled: %v", err)
+		tc.ExporterType = telemetry.ExporterNoop
+		t, _ = telemetry.NewTracerProvider(tc)
+	}
+	switch t.Exporter() {
+	case telemetry.ExporterOTLP:
+		log.Printf("[Telemetry] tracing: OTLP/HTTP to %s, sampling %.2f of new traces", ob.OTLPEndpoint, ob.SampleRatio)
+	case telemetry.ExporterStdout:
+		log.Printf("[Telemetry] tracing: stdout exporter")
+	default:
+		log.Printf("[Telemetry] tracing off (noop); incoming traceparent is still forwarded to the RAG service")
+	}
+	return t
+}
+
+// startMetricsServer serves Prometheus metrics on an internal-only address.
+func startMetricsServer(addr string) *http.Server {
+	if addr == "" {
+		log.Println("[Metrics] METRICS_ADDR empty: Prometheus endpoint disabled")
+		return nil
+	}
+	ms := &http.Server{Addr: addr, Handler: api.MetricsHandler(), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := ms.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[Metrics] endpoint failed: %v", err)
+		}
+	}()
+	log.Printf("[Metrics] Prometheus endpoint on %s/metrics (internal network only)", addr)
+	return ms
+}
+
 func main() {
 	log.Println("Starting CouncilAI Go backend")
 	cfg, err := config.Load()
@@ -203,6 +249,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("Configuration error:\n%v", err)
 	}
+	metrics.Init()
+	tracer := initTracer(cfg)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracer.Shutdown(ctx); err != nil { // flushes queued spans
+			log.Printf("[Telemetry] shutdown: %v", err)
+		}
+	}()
 
 	srv := api.NewServer(council.New(clients.Members, clients.Chairman, cfg.StageTimeout), cfg.RAGServiceURL)
 	srv.RequestTimeout = cfg.RequestTimeout
@@ -227,6 +282,19 @@ func main() {
 
 	closeRedis := setupRedis(cfg, srv)
 	defer closeRedis()
+	if srv.Breaker != nil {
+		b := srv.Breaker
+		metrics.BreakerState("redis", func() float64 {
+			switch b.State() {
+			case cache.StateOpen:
+				return 2
+			case cache.StateHalfOpen:
+				return 1
+			}
+			return 0
+		})
+	}
+	metricsServer := startMetricsServer(cfg.Observability.MetricsAddr)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.ServerPort,
 		Handler:      srv.Routes(),
@@ -244,6 +312,9 @@ func main() {
 		defer cancel()
 		if err := httpServer.Shutdown(ctx); err != nil {
 			log.Printf("Server shutdown error: %v", err)
+		}
+		if metricsServer != nil {
+			_ = metricsServer.Shutdown(ctx)
 		}
 	}()
 

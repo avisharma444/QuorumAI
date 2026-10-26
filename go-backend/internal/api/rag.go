@@ -1,6 +1,12 @@
 package api
 
 import (
+	"go.opentelemetry.io/otel/attribute"
+	"time"
+
+	"example.com/councilai-starter/internal/metrics"
+	"example.com/councilai-starter/internal/telemetry"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -128,16 +134,58 @@ func (s *Server) postRAG(ctx context.Context, path string, body any, out any) (i
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req, done := startRAG(ctx, path, req)
 	res, err := s.HTTP.Do(req)
 	if err != nil {
+		done(0, err)
 		return 0, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
+		done(res.StatusCode, nil)
 		return res.StatusCode, fmt.Errorf("RAG service %s returned %d", path, res.StatusCode)
 	}
 	if err := json.NewDecoder(io.LimitReader(res.Body, 4<<20)).Decode(out); err != nil {
+		done(res.StatusCode, err)
 		return res.StatusCode, fmt.Errorf("RAG service %s: invalid response: %w", path, err)
 	}
+	done(res.StatusCode, nil)
 	return res.StatusCode, nil
+}
+
+// startRAG opens a client span for one call to the Python RAG service and
+// injects the W3C traceparent (and baggage) into the request, so the
+// Python server span joins this trace. The returned function records the
+// outcome (span status, duration histogram, dependency error counter).
+// endpoint is a fixed path such as "/retrieve", never a URL with data.
+func startRAG(ctx context.Context, endpoint string, req *http.Request) (*http.Request, func(status int, err error)) {
+	ctx, span := telemetry.StartClient(ctx, "rag POST "+endpoint,
+		attribute.String("rag.endpoint", endpoint), attribute.String("http.request.method", req.Method))
+	req = req.WithContext(ctx)
+	telemetry.Inject(ctx, req)
+	start := time.Now()
+	return req, func(status int, err error) {
+		result := "ok"
+		switch {
+		case err != nil && ctx.Err() != nil:
+			result = "cancelled"
+		case err != nil:
+			result = "error"
+		case status >= 500:
+			result = "http_5xx"
+		case status >= 400:
+			result = "http_4xx"
+		}
+		metrics.RAGRequestDuration.WithLabelValues(endpoint, result).Observe(time.Since(start).Seconds())
+		if result == "error" || result == "http_5xx" {
+			metrics.DependencyErrors.WithLabelValues("rag", strings.TrimPrefix(endpoint, "/")).Inc()
+		}
+		if status != 0 {
+			span.SetAttributes(attribute.Int("http.response.status_code", status))
+		}
+		if result != "ok" {
+			telemetry.Fail(span, result)
+		}
+		span.End()
+	}
 }

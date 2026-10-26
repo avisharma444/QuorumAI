@@ -1,6 +1,10 @@
 package middleware
 
 import (
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"example.com/councilai-starter/internal/metrics"
+
 	"context"
 	"encoding/json"
 	"fmt"
@@ -106,7 +110,10 @@ func limiter(t *testing.T, rps float64, burst int, policy FailurePolicy) (*RateL
 }
 
 func TestIntegrationGCRABurstThenRefill(t *testing.T) {
-	rl, _ := limiter(t, 20, 3, FailClosed) // 1 request per 50 ms, burst 3
+	// 1 request per 500 ms, burst 3. A slow rate keeps the test independent
+	// of scheduling delays (at 50 ms per token, a busy machine refilled a
+	// token between "back-to-back" requests).
+	rl, _ := limiter(t, 2, 3, FailClosed)
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
 		d, err := rl.Allow(ctx, "u1")
@@ -115,10 +122,10 @@ func TestIntegrationGCRABurstThenRefill(t *testing.T) {
 		}
 	}
 	d, _ := rl.Allow(ctx, "u1")
-	if d.Allowed || d.RetryAfter <= 0 || d.RetryAfter > 60*time.Millisecond {
+	if d.Allowed || d.RetryAfter <= 0 || d.RetryAfter > 510*time.Millisecond {
 		t.Fatalf("4th request: %+v", d)
 	}
-	time.Sleep(d.RetryAfter + 5*time.Millisecond)
+	time.Sleep(d.RetryAfter + 20*time.Millisecond)
 	if d, _ := rl.Allow(ctx, "u1"); !d.Allowed {
 		t.Fatal("one token must refill after the emission interval")
 	}
@@ -173,6 +180,7 @@ func TestIntegrationLimiterMemoryIsBounded(t *testing.T) {
 func TestIntegrationMiddlewareReturns429WithRetryAfter(t *testing.T) {
 	rl, _ := limiter(t, 1, 2, FailClosed)
 	h := rl.Middleware(func(r *http.Request) (string, bool) { return r.Header.Get("X-Test-User"), true })(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	limited := testutil.ToFloat64(metrics.RateLimitRejections.WithLabelValues("other", "limited"))
 	codes := []int{}
 	var last *httptest.ResponseRecorder
 	for i := 0; i < 3; i++ {
@@ -185,6 +193,9 @@ func TestIntegrationMiddlewareReturns429WithRetryAfter(t *testing.T) {
 	}
 	if fmt.Sprint(codes) != "[200 200 429]" {
 		t.Fatalf("codes %v", codes)
+	}
+	if testutil.ToFloat64(metrics.RateLimitRejections.WithLabelValues("other", "limited"))-limited != 1 {
+		t.Fatal("429 not counted as a rate-limit rejection")
 	}
 	ra, _ := strconv.Atoi(last.Header().Get("Retry-After"))
 	var body map[string]string
@@ -203,13 +214,18 @@ func TestRedisOutagePolicies(t *testing.T) {
 		code   int
 	}{{FailClosed, 503}, {FailOpen, 200}} {
 		client := cache.NewClient(dead, "", 0)
-		rl, _ := NewRateLimiter(client, nil, 10, 10, "x", tc.policy)
+		unavailable := testutil.ToFloat64(metrics.RateLimitRejections.WithLabelValues("user", "unavailable"))
+		rl, _ := NewRateLimiter(client, nil, 10, 10, "user", tc.policy)
 		reached := false
 		h := rl.Middleware(func(*http.Request) (string, bool) { return "u", true })(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true }))
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("POST", "/", nil))
 		if rec.Code != tc.code || reached != (tc.policy == FailOpen) {
 			t.Fatalf("%s: %d reached=%v", tc.policy, rec.Code, reached)
+		}
+		want := map[FailurePolicy]float64{FailClosed: 1, FailOpen: 0}[tc.policy]
+		if testutil.ToFloat64(metrics.RateLimitRejections.WithLabelValues("user", "unavailable"))-unavailable != want {
+			t.Fatalf("%s: unavailable rejections not counted correctly", tc.policy)
 		}
 		client.Close()
 	}

@@ -129,7 +129,7 @@ Please revise your answer to address the issues identified. Maintain accuracy an
 // chairmanSynthesize asks the chairman for the structured synthesis. A
 // response that does not validate is an error; the caller falls back.
 func (c *Council) chairmanSynthesize(ctx context.Context, question string, ev Evidence, cands []Candidate, reviews []Review) (*ChairmanResult, *llm.Usage, error) {
-	resp, err := c.call(ctx, c.Chairman, chairmanSystemPrompt, chairmanUserMessage(question, ev, cands, reviews), func(o *llm.GenerateOptions) {
+	resp, err := c.call(ctx, "chairman", c.Chairman, chairmanSystemPrompt, chairmanUserMessage(question, ev, cands, reviews), func(o *llm.GenerateOptions) {
 		o.ResponseJSON = true
 	})
 	if err != nil {
@@ -144,7 +144,7 @@ func (c *Council) chairmanSynthesize(ctx context.Context, question string, ev Ev
 
 // reflectOn runs the quality audit with the reference settings.
 func (c *Council) reflectOn(ctx context.Context, question string, ev Evidence, answer string) (*ReflectionResult, *llm.Usage, error) {
-	resp, err := c.call(ctx, c.Chairman, reflectionSystemPrompt, reflectionUserMessage(question, ev, answer), func(o *llm.GenerateOptions) {
+	resp, err := c.call(ctx, "reflection", c.Chairman, reflectionSystemPrompt, reflectionUserMessage(question, ev, answer), func(o *llm.GenerateOptions) {
 		o.Temperature, o.ResponseJSON, o.MaxTokens = llm.Float64Ptr(0.2), true, 500
 	})
 	if err != nil {
@@ -159,7 +159,7 @@ func (c *Council) reflectOn(ctx context.Context, question string, ev Evidence, a
 
 // reviseAnswer asks the chairman for one revision, validated like synthesis.
 func (c *Council) reviseAnswer(ctx context.Context, question string, ev Evidence, previous string, r ReflectionResult) (*ChairmanResult, *llm.Usage, error) {
-	resp, err := c.call(ctx, c.Chairman, chairmanSystemPrompt, revisionUserMessage(question, ev, previous, r), func(o *llm.GenerateOptions) {
+	resp, err := c.call(ctx, "revision", c.Chairman, chairmanSystemPrompt, revisionUserMessage(question, ev, previous, r), func(o *llm.GenerateOptions) {
 		o.ResponseJSON = true
 	})
 	if err != nil {

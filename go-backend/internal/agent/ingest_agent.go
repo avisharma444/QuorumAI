@@ -38,7 +38,7 @@ func (a *IngestAgent) SummarizeDocument(ctx context.Context, previewText string)
 	if strings.TrimSpace(previewText) == "" {
 		return "", ErrEmptyPreview
 	}
-	resp, err := a.client.GenerateChat(ctx, llm.GenerateOptions{
+	resp, err := llm.Call(ctx, "ingest_summary", a.client, llm.GenerateOptions{
 		Messages: []llm.Message{
 			{Role: "system", Content: summarizePrompt},
 			{Role: "user", Content: fmt.Sprintf("Document Sample:\n%s", previewText)},
