@@ -1,0 +1,38 @@
+services:
+  python-rag:
+    build: ./python-rag
+    ports:
+      - "8000:8000"
+    volumes:
+      - documents:/data
+    environment:
+      - EMBEDDING_BACKEND=hash
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  go-backend:
+    build: ./go-backend
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - RAG_URL=http://python-rag:8000
+    depends_on:
+      python-rag:
+        condition: service_healthy
+
+  ui:
+    build: ./ui
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://go-backend:8080
+    depends_on:
+      - go-backend
+
+volumes:
+  documents:

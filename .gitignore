@@ -1,0 +1,23 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.sqlite
+*.sqlite3
+*.db
+.DS_Store
+results/
+*.log
+
+# Go build output and editor files
+/go-backend/server
+/go-backend/councilai
+*.test
+*.out
+coverage.*
+.idea/
+.vscode/
+# Local secrets
+.env.*
+!.env.example
