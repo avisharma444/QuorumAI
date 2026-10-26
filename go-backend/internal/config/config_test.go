@@ -158,3 +158,21 @@ func TestMissingFileIsAnError(t *testing.T) {
 		t.Fatal("explicit missing file accepted")
 	}
 }
+
+func TestWebSearchSwitch(t *testing.T) {
+	cfg, err := LoadFrom(repoConfig, env(nil))
+	if err != nil || !cfg.WebSearch {
+		t.Fatalf("web search should default on (reference behaviour): %v", err)
+	}
+	cfg, _ = LoadFrom(repoConfig, env(map[string]string{"WEB_SEARCH_ENABLED": "false"}))
+	if cfg.WebSearch {
+		t.Fatal("WEB_SEARCH_ENABLED=false ignored")
+	}
+	cfg, _ = LoadFrom(writeYAML(t, "rag:\n  web_search: false\n"), env(map[string]string{"COUNCIL_1_MODEL": "m"}))
+	if cfg.WebSearch {
+		t.Fatal("rag.web_search: false ignored")
+	}
+	if _, err := LoadFrom(repoConfig, env(map[string]string{"WEB_SEARCH_ENABLED": "sometimes"})); err == nil {
+		t.Fatal("invalid boolean accepted")
+	}
+}

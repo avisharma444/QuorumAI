@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"example.com/councilai-starter/internal/agent"
 	"example.com/councilai-starter/internal/api"
 	"example.com/councilai-starter/internal/config"
 	"example.com/councilai-starter/internal/council"
@@ -26,8 +27,6 @@ const (
 )
 
 // pipelineClients holds one independently configured client per role.
-// Router and Ingestion are built and validated now but not used until the
-// routing and ingestion-agent phases.
 type pipelineClients struct {
 	Members   []llm.LLMClient
 	Chairman  llm.LLMClient
@@ -93,8 +92,9 @@ func startupSummary(cfg *config.Config, clients pipelineClients) []string {
 	}
 	lines = append(lines,
 		"Chairman: "+clients.Chairman.ModelName(),
-		"Router (not used yet): "+clients.Router.ModelName(),
-		"Ingestion (not used yet): "+clients.Ingestion.ModelName(),
+		"Router: "+clients.Router.ModelName(),
+		"Ingestion summarizer: "+clients.Ingestion.ModelName(),
+		fmt.Sprintf("Web search grounding for questions without a document: %t", cfg.WebSearch),
 	)
 	return lines
 }
@@ -112,6 +112,9 @@ func main() {
 
 	srv := api.NewServer(council.New(clients.Members, clients.Chairman, cfg.StageTimeout), cfg.RAGServiceURL)
 	srv.RequestTimeout = cfg.RequestTimeout
+	srv.Router = agent.NewRouter(clients.Router)
+	srv.IngestAgent = agent.NewIngestAgent(clients.Ingestion)
+	srv.WebSearch = cfg.WebSearch
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.ServerPort,
 		Handler:      srv.Routes(),

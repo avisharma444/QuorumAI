@@ -24,6 +24,10 @@ func StageOf(system string) string {
 		return "member"
 	case strings.HasPrefix(system, "DIRECT_AGENT"):
 		return "direct"
+	case strings.HasPrefix(system, "You are a query classifier"):
+		return "route"
+	case strings.HasPrefix(system, "You are a document summarization agent"):
+		return "summarize"
 	}
 	return "unknown"
 }

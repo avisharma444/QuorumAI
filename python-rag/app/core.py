@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .sampling import bme_preview
+
 VECTOR_DIM = 384
 
 
@@ -115,7 +117,16 @@ class DocumentStore:
             self.conn.executemany("INSERT INTO chunks(doc_id,chunk_index,page,content,vector) VALUES (?,?,?,?,?)", [
                 (doc_id, i, c.page, c.text, json.dumps(vector)) for i, (c, vector) in enumerate(zip(chunks, vectors))
             ])
-        return {"doc_id": doc_id, "filename": filename, "pages": len(pages), "chunks": len(chunks), "embedding_backend": self.embedder.backend}
+        return {
+            "doc_id": doc_id,
+            "filename": filename,
+            "pages": len(pages),
+            "chunks": len(chunks),
+            "chunk_count": len(chunks),  # reference field name
+            "embedding_backend": self.embedder.backend,
+            # BME sample of the real extracted chunks, for the Go summarizer.
+            "preview_text": bme_preview([c.text for c in chunks]),
+        }
 
     def retrieve(self, doc_id: str, question: str, top_k: int = 4) -> list[dict]:
         if not doc_id.strip():

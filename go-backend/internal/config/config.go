@@ -32,6 +32,7 @@ type Config struct {
 	ServerPort    string
 	RAGServiceURL string
 	MockLLM       bool // explicit offline mode; no provider is contacted
+	WebSearch     bool // web grounding for questions without a document (reference default: on)
 
 	OpenRouterAPIKey string
 	OpenRouterURL    string
@@ -75,6 +76,7 @@ type yamlSchema struct {
 	} `yaml:"server"`
 	RAG struct {
 		ServiceURL string `yaml:"service_url"`
+		WebSearch  *bool  `yaml:"web_search"`
 	} `yaml:"rag"`
 	Providers struct {
 		OpenRouterURL string `yaml:"openrouter_url"`
@@ -146,6 +148,11 @@ func LoadFrom(path string, getenv func(string) string) (*Config, error) {
 	cfg.ServerPort = l.str("SERVER_PORT", y.Server.Port, "8080")
 	cfg.RAGServiceURL = l.str("RAG_SERVICE_URL", y.RAG.ServiceURL, "http://python-rag:8000")
 	cfg.MockLLM = l.boolean("MOCK_LLM", false)
+	webDefault := true
+	if y.RAG.WebSearch != nil {
+		webDefault = *y.RAG.WebSearch
+	}
+	cfg.WebSearch = l.boolean("WEB_SEARCH_ENABLED", webDefault)
 
 	cfg.OpenRouterAPIKey = getenv("OPENROUTER_API_KEY")
 	cfg.GeminiAPIKey = getenv("GEMINI_API_KEY")

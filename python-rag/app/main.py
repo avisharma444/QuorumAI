@@ -7,9 +7,11 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from .core import DocumentStore, Embedder
+from .search_agent import WebSearchAgent
 
 app = FastAPI(title="CouncilAI document retrieval", version="0.1.0")
 store = DocumentStore(os.getenv("DATABASE_PATH", "./documents.sqlite3"), Embedder())
+search_agent = WebSearchAgent()
 
 
 class RetrieveRequest(BaseModel):
@@ -44,3 +46,18 @@ def retrieve(req: RetrieveRequest) -> dict:
         raise HTTPException(404, "Document not found") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=10000)
+    max_results: int = Field(default=3, ge=1, le=10)
+
+
+@app.post("/search")
+def web_search(req: SearchRequest) -> dict:
+    """Live web-search grounding (reference: routers/search.py).
+
+    Always 200 with a status, so search problems degrade the answer's grounding
+    rather than failing the query: "ok", "no_results" or "search_failed".
+    """
+    return search_agent.search(req.query, req.max_results).as_dict()

@@ -133,7 +133,7 @@ func TestMixedProviderCouncilEndToEnd(t *testing.T) {
 		replies{"chair": "Chairman synthesis"},
 	)
 	log := &eventLog{}
-	res, err := c.Run(context.Background(), QueryRequest{Question: "Compare X and Y", Strategy: "council"}, nil, log.emit)
+	res, err := c.Run(context.Background(), QueryRequest{Question: "Compare X and Y", Strategy: "council"}, Evidence{}, log.emit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestMixedProviderPartialFailure(t *testing.T) {
 		replies{"member": "HTTP 500", "review": "RANKING: A, B\nREASONING: x"},
 		replies{"chair": "HTTP 401"},
 	)
-	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council_deep"}, nil, nil)
+	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council_deep"}, Evidence{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestDirectAndDeepWithGeminiChairman(t *testing.T) {
 	f := llmtest.New(nil)
 	c := New(f.Clients("a", "b", "c"), chairman, 5*time.Second)
 
-	res, err := c.Run(context.Background(), QueryRequest{Question: "hi", Strategy: "direct"}, nil, nil)
+	res, err := c.Run(context.Background(), QueryRequest{Question: "hi", Strategy: "direct"}, Evidence{}, nil)
 	if err != nil || res.Answer != "direct answer" || res.Source != "direct:gemini:gemini-chair" || res.TokenUsage.TotalTokens != 15 {
 		t.Fatalf("direct: %+v %v", res, err)
 	}
@@ -242,14 +242,14 @@ func TestDirectAndDeepWithGeminiChairman(t *testing.T) {
 	if f.Count("member")+f.Count("review") != 0 {
 		t.Fatal("direct mode must bypass the council")
 	}
-	if _, err := c.Run(context.Background(), QueryRequest{Question: "hi", Strategy: "direct"}, []string{"evidence"}, nil); err != nil {
+	if _, err := c.Run(context.Background(), QueryRequest{Question: "hi", Strategy: "direct"}, Evidence{Kind: EvidenceDocument, Passages: []string{"evidence"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := chair.body("direct")["tools"]; ok {
 		t.Fatal("search must be off when document evidence is supplied")
 	}
 
-	res, err = c.Run(context.Background(), QueryRequest{Question: "Compare", Strategy: "council_deep"}, nil, nil)
+	res, err = c.Run(context.Background(), QueryRequest{Question: "Compare", Strategy: "council_deep"}, Evidence{}, nil)
 	if err != nil || res.Answer != "draft" || res.Reflection != "good: grounded" {
 		t.Fatalf("deep: %+v %v", res, err)
 	}

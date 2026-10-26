@@ -22,6 +22,14 @@ func testCouncil(f *llmtest.Fake) *council.Council {
 
 var errProvider = errors.New("provider down")
 
+// newTestServer disables web search: these tests have no RAG service, and web
+// grounding has its own tests with a fake one.
+func newTestServer(c *council.Council, ragURL string) *Server {
+	s := NewServer(c, ragURL)
+	s.WebSearch = false
+	return s
+}
+
 // ── HTTP integration ────────────────────────────────────────────────
 
 func postQuery(t *testing.T, srv *Server, body string, stream bool) *httptest.ResponseRecorder {
@@ -61,7 +69,7 @@ func parseSSE(t *testing.T, body string) []sseEvent {
 }
 
 func TestHTTPJSONResponse(t *testing.T) {
-	srv := NewServer(testCouncil(llmtest.New(nil)), "http://unused.invalid")
+	srv := newTestServer(testCouncil(llmtest.New(nil)), "http://unused.invalid")
 	rec := postQuery(t, srv, `{"question":"Compare A and B","strategy":"council"}`, false)
 	if rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
@@ -79,13 +87,13 @@ func TestHTTPJSONResponse(t *testing.T) {
 }
 
 func TestSSEEventOrder(t *testing.T) {
-	srv := NewServer(testCouncil(llmtest.New(nil)), "http://unused.invalid")
+	srv := newTestServer(testCouncil(llmtest.New(nil)), "http://unused.invalid")
 	events := parseSSE(t, postQuery(t, srv, `{"question":"compare A vs B","strategy":"council"}`, true).Body.String())
 	var names []string
 	for _, e := range events {
 		names = append(names, e.name)
 	}
-	want := []string{"start", "retrieved", "candidate", "candidate", "candidate", "review", "review", "review", "final"}
+	want := []string{"start", "routing", "retrieved", "candidate", "candidate", "candidate", "review", "review", "review", "final"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("got events %v, want %v", names, want)
 	}
@@ -98,7 +106,7 @@ func TestSSEEventOrder(t *testing.T) {
 
 func TestSSEReviewErrorAndFallbackEvents(t *testing.T) {
 	f := llmtest.New(map[string]llmtest.Reply{"review/a": {Err: errProvider}, "chair/chair": {Err: errProvider}})
-	srv := NewServer(testCouncil(f), "http://unused.invalid")
+	srv := newTestServer(testCouncil(f), "http://unused.invalid")
 	events := parseSSE(t, postQuery(t, srv, `{"question":"compare","strategy":"council"}`, true).Body.String())
 	seen := map[string]int{}
 	for _, e := range events {
@@ -114,7 +122,7 @@ func TestSSEReviewErrorAndFallbackEvents(t *testing.T) {
 
 func TestHTTPCaching(t *testing.T) {
 	f := llmtest.New(nil)
-	srv := NewServer(testCouncil(f), "http://unused.invalid")
+	srv := newTestServer(testCouncil(f), "http://unused.invalid")
 	body := `{"question":"Compare concurrency and parallelism","strategy":"council"}`
 	var first, second council.QueryResult
 	_ = json.Unmarshal(postQuery(t, srv, body, false).Body.Bytes(), &first)
@@ -132,7 +140,7 @@ func TestHTTPCaching(t *testing.T) {
 
 func TestDirectModeBypassesPeerReview(t *testing.T) {
 	f := llmtest.New(map[string]llmtest.Reply{"direct/chair": {Text: "direct answer"}})
-	srv := NewServer(testCouncil(f), "http://unused.invalid")
+	srv := newTestServer(testCouncil(f), "http://unused.invalid")
 	var out council.QueryResult
 	_ = json.Unmarshal(postQuery(t, srv, `{"question":"hi","strategy":"direct"}`, false).Body.Bytes(), &out)
 	if out.Answer != "direct answer" || out.Source != "direct:chair" || len(out.Reviews) != 0 {
@@ -153,7 +161,7 @@ func TestDocumentRetrievalFeedsTheCouncil(t *testing.T) {
 	}))
 	defer rag.Close()
 	f := llmtest.New(nil)
-	srv := NewServer(testCouncil(f), rag.URL)
+	srv := newTestServer(testCouncil(f), rag.URL)
 	var out council.QueryResult
 	rec := postQuery(t, srv, `{"question":"What colour is the sky?","doc_id":"doc-1","strategy":"council"}`, false)
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)

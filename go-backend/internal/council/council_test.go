@@ -46,7 +46,7 @@ func testCouncil(f *llmtest.Fake) *Council {
 func runCouncil(t *testing.T, m *llmtest.Fake, strategy string) (QueryResult, *eventLog, error) {
 	t.Helper()
 	log := &eventLog{}
-	res, err := testCouncil(m).Run(context.Background(), QueryRequest{Question: "Compare X and Y", Strategy: strategy}, nil, log.emit)
+	res, err := testCouncil(m).Run(context.Background(), QueryRequest{Question: "Compare X and Y", Strategy: strategy}, Evidence{}, log.emit)
 	return res, log, err
 }
 
@@ -247,7 +247,7 @@ func TestReviewersSeeAnonymizedAnswers(t *testing.T) {
 		"member/secret-claude": {Text: "Answer about Y."},
 	})
 	c := New(f.Clients("secret-gpt", "secret-claude"), f.Client("chair"), time.Second)
-	if _, err := c.Run(context.Background(), QueryRequest{Question: "Q?", Strategy: "council"}, nil, nil); err != nil {
+	if _, err := c.Run(context.Background(), QueryRequest{Question: "Q?", Strategy: "council"}, Evidence{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	p := f.Prompt("review", "secret-gpt")
@@ -361,7 +361,7 @@ func TestCancellationStopsTheRun(t *testing.T) {
 	c.StageTimeout = time.Minute
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.Run(ctx, QueryRequest{Question: "Q", Strategy: "council"}, nil, log.emit)
+		_, err := c.Run(ctx, QueryRequest{Question: "Q", Strategy: "council"}, Evidence{}, log.emit)
 		done <- err
 	}()
 	select {
@@ -390,7 +390,7 @@ func TestCancellationDuringReviewIsNotAFallback(t *testing.T) {
 		}
 		return nil
 	}
-	_, err := testCouncil(f).Run(ctx, QueryRequest{Question: "Q", Strategy: "council"}, nil, nil)
+	_, err := testCouncil(f).Run(ctx, QueryRequest{Question: "Q", Strategy: "council"}, Evidence{}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
@@ -407,7 +407,7 @@ func TestStageTimeoutFailsOnlyTheSlowModel(t *testing.T) {
 	}
 	c := testCouncil(f)
 	c.StageTimeout = 50 * time.Millisecond
-	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, nil, nil)
+	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, Evidence{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,14 +559,56 @@ func TestDeepReflectionRevisesAfterChairman(t *testing.T) {
 	}
 }
 
+// Strategy selection is the LLM router's job; Run only executes a resolved
+// strategy and refuses "auto" or anything unknown.
 func TestStrategyValidation(t *testing.T) {
-	if _, err := StrategyFor(QueryRequest{Question: "Q", Strategy: "bogus"}); err == nil {
-		t.Fatal("unknown strategy accepted")
+	for _, bad := range []string{"", "auto", "bogus"} {
+		f := llmtest.New(nil)
+		if _, err := testCouncil(f).Run(context.Background(), QueryRequest{Question: "Q", Strategy: bad}, Evidence{}, nil); err == nil {
+			t.Fatalf("strategy %q accepted", bad)
+		}
+		if len(f.Calls()) != 0 {
+			t.Fatalf("strategy %q called models", bad)
+		}
 	}
-	if value, _ := StrategyFor(QueryRequest{Question: "hello"}); value != "direct" {
-		t.Fatalf("got %q", value)
+	for _, ok := range []string{"direct", "council", "council_deep"} {
+		if !ValidStrategy(ok) {
+			t.Fatalf("%q rejected", ok)
+		}
 	}
-	if value, _ := StrategyFor(QueryRequest{Question: "hello", DocID: "doc1"}); value != "council" {
-		t.Fatalf("got %q", value)
+}
+
+func TestEvidenceIsLabelledByKind(t *testing.T) {
+	cases := []struct {
+		ev        Evidence
+		grounding string
+		label     string
+	}{
+		{Evidence{}, "none", "No document context was supplied."},
+		{Evidence{Kind: EvidenceDocument, Passages: []string{"[Document d, page 1] text"}}, "document", "Document excerpts from the attached document"},
+		{Evidence{Kind: EvidenceWeb, Passages: []string{"Source [1]: T\nURL: u\nContent: c\n"}}, "web", "Web search results (unverified third-party pages"},
+		{Evidence{Kind: EvidenceWeb}, "none", "No document context was supplied."}, // empty web results ground nothing
+	}
+	for _, tc := range cases {
+		f := llmtest.New(nil)
+		res, err := testCouncil(f).Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, tc.ev, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Grounding != tc.grounding {
+			t.Fatalf("grounding %q, want %q", res.Grounding, tc.grounding)
+		}
+		for _, stage := range []string{"member", "chair"} {
+			model := "a"
+			if stage == "chair" {
+				model = "chair"
+			}
+			if p := f.Prompt(stage, model); !strings.Contains(p, tc.label) {
+				t.Fatalf("%s prompt missing %q:\n%s", stage, tc.label, p)
+			}
+		}
+		if tc.grounding == "web" && strings.Contains(f.Prompt("member", "a"), "Document excerpts") {
+			t.Fatal("web results must not be presented as document excerpts")
+		}
 	}
 }

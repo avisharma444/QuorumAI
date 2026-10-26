@@ -22,6 +22,12 @@ with st.sidebar:
             info = r.json()
             st.session_state.doc_id = info["doc_id"]
             st.success(f"Indexed {info['chunks']} chunks on {info['pages']} pages")
+            status = info.get("summary_status", "unknown")
+            if info.get("summary"):
+                st.caption(f"Document summary ({info.get('summary_model', 'ingestion model')}):")
+                st.info(info["summary"])
+            else:
+                st.warning(f"No document summary ({status}). Queries will still use this document. {info.get('summary_error', '')}")
         except requests.RequestException as exc:
             st.error(f"Ingestion failed: {exc}")
     if st.session_state.doc_id:
@@ -29,7 +35,12 @@ with st.sidebar:
         if st.button("Detach"):
             st.session_state.doc_id = ""
     st.divider()
-    strategy = st.selectbox("Execution strategy", ["auto", "direct", "council", "council_deep"], index=2)
+    strategy = st.selectbox(
+        "Execution strategy",
+        ["auto", "direct", "council", "council_deep"],
+        index=0,
+        help="auto: the LLM router chooses the strategy and whether to use the document. Other values are diagnostic overrides that skip the router.",
+    )
     streaming = st.checkbox("Show streaming stage events", value=True)
     st.caption("Model keys and providers are configured using .env, not this UI.")
 
@@ -67,6 +78,23 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
             st.write(result.get("answer", ""))
             st.caption(f"Strategy: {result.get('strategy')} | Server latency: {result.get('duration_ms')} ms | Cache hit: {result.get('cache_hit')}")
             st.caption(f"Answer source: {result.get('source', '')} | Peer reviewed: {result.get('peer_reviewed', False)} | Top peer-ranked: {result.get('selected') or '—'}")
+            routing = result.get("routing") or {}
+            if routing:
+                how = "LLM router" if routing.get("mode") == "auto" else "explicit override (diagnostic)"
+                if routing.get("fallback"):
+                    how += " — router failed, default plan used"
+                st.caption(f"Routing: {routing.get('strategy')} via {how}" + (f" ({routing.get('router_model')})" if routing.get("router_model") else ""))
+                if routing.get("reasoning"):
+                    st.caption(f"Router reasoning: {routing['reasoning']}")
+                if routing.get("document_attached"):
+                    st.caption(f"Document attached: summary {routing.get('document_summary')}, needed: {routing.get('needs_doc')}, used: {routing.get('document_used')}")
+            grounding = result.get("grounding", "none")
+            labels = {"document": "attached document", "web": "web search results (unverified)", "none": "none — answered from model knowledge only"}
+            st.caption(f"Grounding: {labels.get(grounding, grounding)}")
+            if routing.get("grounding_error"):
+                st.warning(f"Grounding unavailable: {routing['grounding_error']}")
+            for src in routing.get("web_sources") or []:
+                st.caption(f"[{src['rank']}] [{src['title'] or src['url']}]({src['url']}) — {src['content_source'].replace('_', ' ')}")
             usage = result.get("token_usage")
             st.caption(f"Token usage (provider-reported): {usage['total_tokens']} total" if usage else "Token usage: not reported by the providers")
             st.caption(result.get("confidence_note", ""))

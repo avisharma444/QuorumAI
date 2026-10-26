@@ -10,6 +10,9 @@ server:
 
 rag:
   service_url: "http://python-rag:8000"
+  # Questions without a document are grounded with DuckDuckGo results via the
+  # RAG service's /search endpoint (reference behaviour). WEB_SEARCH_ENABLED overrides.
+  web_search: true
 
 providers:
   openrouter_url: "https://openrouter.ai/api/v1/chat/completions"
@@ -29,10 +32,10 @@ council:
   chairman:
     provider: "gemini"
     model: "gemini-2.5-flash"
-  router: # configured and validated now; used from the routing phase
+  router: # LLM query router: picks direct / council / council_deep and needs_doc
     provider: "gemini"
     model: "gemini-2.5-flash"
-  ingestion: # configured and validated now; used from the ingestion-agent phase
+  ingestion: # summarizes each uploaded document's BME sample for the router
     provider: "gemini"
     model: "gemini-2.5-flash"
   timeouts:

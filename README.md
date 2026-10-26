@@ -80,7 +80,26 @@ curl -N -X POST http://localhost:8080/api/v1/query \
   -d '{"question":"Compare Go and Python concurrency","strategy":"council_deep"}'
 ```
 
-Valid strategies: `auto`, `direct`, `council`, `council_deep`. `auto` currently uses **simple deterministic heuristics**; it is not an LLM router yet.
+### How a query is routed
+
+`strategy` defaults to `auto`: the configured **router model** reads the
+question (and the attached document's summary) and returns JSON choosing
+`direct`, `council` or `council_deep`, plus whether the document is needed.
+`direct`, `council` and `council_deep` can also be sent explicitly as a
+diagnostic override that skips the router.
+
+- Uploading a document returns `preview_text` (a Beginning-Middle-End sample
+  of its chunks) and a `summary` written by the **ingestion model**. The
+  summary is kept in the backend's in-memory cache for 1 hour (the reference
+  uses Redis; summaries are lost on restart until the Redis phase).
+- Questions without a document are grounded with live DuckDuckGo results
+  (Python `/search`). Responses report `grounding` (`document`, `web` or
+  `none`) and a `routing` block (strategy, reasoning, document use, errors).
+- Router failures fall back to `council`, keeping any attached document. If a
+  document's summary is missing, the document is still used.
+- Mock mode (`MOCK_LLM=true`) routes with explicit markers in the question:
+  `#route=direct|council|council_deep|invalid` and `#needs_doc=true|false`.
+  Without markers the mock router picks `council`.
 
 ### Use real model providers
 
@@ -114,7 +133,7 @@ include provider-reported token usage per call and in total (`token_usage`).
 # Go tests, including race detector
 (cd go-backend && go test -race ./...)
 # Python pure-core tests
-(cd python-rag && python -m pytest -q tests)
+(cd python-rag && pip install -r requirements-dev.txt && python -m pytest -q tests)
 # Both API servers must be running for the smoke test
 python tests/e2e_smoke.py
 # Both API servers must be running for the HTTP benchmark

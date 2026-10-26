@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -52,8 +53,45 @@ func (m *MockClient) GenerateChat(ctx context.Context, opts GenerateOptions) (*R
 	return &Response{Answer: mockAnswer(m.ModelName(), sys, prompt), Model: m.ModelName()}, nil
 }
 
+// Mock routing directives, written in the question text (mock mode only):
+//
+//	#route=direct|council|council_deep   strategy the mock router returns
+//	#route=invalid                       malformed output, to exercise the router fallback
+//	#needs_doc=true|false                document decision the mock router returns
+//
+// Without directives the mock router returns "council", with needs_doc true
+// only when a document summary is supplied. Real routing always uses the
+// configured router model.
+var (
+	mockRouteDirective    = regexp.MustCompile(`#route=([a-z_]+)`)
+	mockNeedsDocDirective = regexp.MustCompile(`#needs_doc=(true|false)`)
+)
+
+func mockRoute(prompt string) string {
+	strategy, reasoning := "council", "Mock router default; not a real classification."
+	if m := mockRouteDirective.FindStringSubmatch(prompt); m != nil {
+		if m[1] == "invalid" {
+			return "I think this needs the council."
+		}
+		strategy, reasoning = m[1], "Mock router: strategy taken from #route directive."
+	}
+	needsDoc := strings.Contains(prompt, "Attached Document Summary:")
+	if m := mockNeedsDocDirective.FindStringSubmatch(prompt); m != nil {
+		needsDoc = m[1] == "true"
+	}
+	return fmt.Sprintf(`{"strategy":%q,"reasoning":%q,"needs_doc":%t}`, strategy, reasoning, needsDoc)
+}
+
 func mockAnswer(model, system, prompt string) string {
 	switch {
+	case strings.Contains(system, "query classifier for a multi-LLM council"):
+		return mockRoute(prompt)
+	case strings.Contains(system, "document summarization agent"):
+		sample := strings.Join(strings.Fields(strings.TrimPrefix(prompt, "Document Sample:")), " ")
+		if len(sample) > 120 {
+			sample = sample[:120]
+		}
+		return "[MOCK summary] Placeholder summary from the offline mock model, not a real summary. Sample begins: " + sample
 	case strings.Contains(system, "REVIEW_AGENT"):
 		// Rank responses in the order shown. This proves the pipeline works
 		// offline; it is not a quality judgment.
