@@ -1,0 +1,19 @@
+# Model pricing for cost ESTIMATES (USD per million tokens).
+#
+# Only entries with verified: true are used, and a verified entry must
+# cite the provider's pricing page (source) and the date it was checked
+# (effective_date). Unverified or missing models are reported as
+# "cost unmeasured", never filled in with a guess.
+#
+# Real-model runs refuse to start unless every configured model has a
+# verified price here. Fill this in from the provider pages on the day of
+# the experiment; prices change.
+#
+# Example (NOT verified, shown for the format only):
+#   - model: "gemini:gemini-2.5-flash"     # exactly as /health reports it
+#     input_usd_per_mtok: 0.0
+#     output_usd_per_mtok: 0.0
+#     source: "https://ai.google.dev/gemini-api/docs/pricing"
+#     effective_date: "YYYY-MM-DD"
+#     verified: false
+models: []

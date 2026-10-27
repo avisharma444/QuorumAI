@@ -2,6 +2,7 @@ package api
 
 import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"strings"
 
 	"context"
 	"errors"
@@ -68,7 +69,8 @@ func (s *Server) Routes() http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	body := map[string]any{"status": "ok", "service": "go-council", "redis": s.redisHealth(r.Context()), "postgres": s.postgresHealth(r.Context())}
+	body := map[string]any{"status": "ok", "service": "go-council", "redis": s.redisHealth(r.Context()), "postgres": s.postgresHealth(r.Context()),
+		"llm": s.llmInfo()}
 	if s.Breaker != nil {
 		body["redis_breaker"] = s.Breaker.State().String()
 	}
@@ -111,4 +113,46 @@ func (s *Server) redisHealth(ctx context.Context) string {
 		return "unhealthy"
 	}
 	return "healthy"
+}
+
+// llmInfo reports the configured model names and whether they are mock
+// clients, without calling any model. Evaluation tools read it before
+// running so a paid backend is never queried by accident. Model names are
+// configuration, not secrets.
+func (s *Server) llmInfo() map[string]any {
+	var names []string
+	info := map[string]any{}
+	if s.Council != nil {
+		var members []string
+		for _, m := range s.Council.Members {
+			members = append(members, m.ModelName())
+		}
+		info["members"] = members
+		names = append(names, members...)
+		if s.Council.Chairman != nil {
+			info["chairman"] = s.Council.Chairman.ModelName()
+			names = append(names, s.Council.Chairman.ModelName())
+		}
+	}
+	if s.Router != nil {
+		info["router"] = s.Router.ModelName()
+		names = append(names, s.Router.ModelName())
+	}
+	mock := 0
+	for _, n := range names {
+		if strings.HasPrefix(n, "mock:") {
+			mock++
+		}
+	}
+	switch {
+	case len(names) == 0:
+		info["mode"] = "none"
+	case mock == len(names):
+		info["mode"] = "mock"
+	case mock == 0:
+		info["mode"] = "live"
+	default:
+		info["mode"] = "mixed"
+	}
+	return info
 }

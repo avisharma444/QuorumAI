@@ -22,7 +22,7 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 
 ### Deliberately NOT implemented yet
 
-- Calibrated confidence scores, quality improvement claims, or real-model performance numbers (load tests so far use mock models)
+- Real-model answer-quality, calibration and cost results (the harness exists; paid runs need approval), quality improvement claims
 - Alerting rules, log aggregation, metrics for the Python service (it is traced, not scraped)
 - Roles/admin users, document sharing between users, deleting documents, token revocation (tokens stay valid until they expire), password reset
 - Documents uploaded before authentication existed have no owner and are therefore not reachable through the API
@@ -245,6 +245,16 @@ include provider-reported token usage per call and in total (`token_usage`).
   `SEMANTIC_CACHE_THRESHOLD`; 0.95 here gave no false positives but little
   reuse). With authentication on, the end-to-end benchmark reproduced the
   same 52% / 28% rates.
+
+## Evaluation
+
+`evaluation/` holds a reproducible evaluation harness: a versioned dataset
+built from SQuAD 2.0, HotpotQA and DROP (500 questions, dev/held-out
+splits), a labelled question-pair set for semantic-cache safety (840 pairs),
+retrieval and cache benchmarks on the real models, and an answer-quality
+runner with statistics, cost accounting and a spend-limited real-model mode
+that has not been run. Results: [docs/evaluation.md](docs/evaluation.md);
+guide: [evaluation/README.md](evaluation/README.md).
 
 ## Observability
 

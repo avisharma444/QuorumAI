@@ -1,0 +1,13 @@
+# Offline (mock-model) workflow validation on the dev split.
+# Real retrieval, routing, caching and council workflow; mock answers.
+# Results validate the harness only: they are NOT model accuracy.
+name: offline-dev
+mode: offline
+api_base: http://go-backend:8080
+metrics_url: http://go-backend:9464/metrics
+dataset: data/councileval-v1
+split: dev
+strategies: [direct, council, council_deep, auto]
+top_k: 4
+repeats: 1
+seed: 7

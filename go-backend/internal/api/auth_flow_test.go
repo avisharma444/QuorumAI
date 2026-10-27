@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"example.com/councilai-starter/internal/llm"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"example.com/councilai-starter/internal/auth"
 	"example.com/councilai-starter/internal/auth/authtest"
@@ -440,4 +442,26 @@ func TestHealthReportsPostgres(t *testing.T) {
 
 func grant(userID, docID string) auth.DocumentGrant {
 	return auth.DocumentGrant{UserID: userID, DocID: docID, Filename: docID + ".md"}
+}
+
+func TestHealthReportsLLMModeWithoutCallingModels(t *testing.T) {
+	e := newEnv(t, nil)
+	var h struct {
+		LLM map[string]any `json:"llm"`
+	}
+	_ = json.Unmarshal(doJSON(t, e.srv, "GET", "/health", "", "").Body.Bytes(), &h)
+	if h.LLM["mode"] != "live" || h.LLM["chairman"] != "chair" || len(e.llm.Calls()) != 0 {
+		t.Fatalf("fake clients are not mock-prefixed: %v (calls %v)", h.LLM, e.llm.Calls())
+	}
+	m := council.New([]llm.LLMClient{&llm.MockClient{Name: "member-1"}}, &llm.MockClient{Name: "chairman"}, time.Second)
+	e.srv.Council, e.srv.Router = m, nil
+	_ = json.Unmarshal(doJSON(t, e.srv, "GET", "/health", "", "").Body.Bytes(), &h)
+	if h.LLM["mode"] != "mock" {
+		t.Fatalf("all-mock backend: %v", h.LLM)
+	}
+	e.srv.Council = council.New([]llm.LLMClient{&llm.MockClient{Name: "member-1"}, e.llm.Client("b")}, &llm.MockClient{Name: "chairman"}, time.Second)
+	_ = json.Unmarshal(doJSON(t, e.srv, "GET", "/health", "", "").Body.Bytes(), &h)
+	if h.LLM["mode"] != "mixed" {
+		t.Fatalf("mixed backend: %v", h.LLM)
+	}
 }

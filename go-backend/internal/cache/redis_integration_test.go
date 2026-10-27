@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -389,4 +390,44 @@ func TestIntegrationRealBGEVectors(t *testing.T) {
 	if _, found, _ := c.Get(ctx, scope, "what was revenue in 2025?", v25, 0.5, &out); found && out == "2024 answer" {
 		t.Fatal("2025 question reused the 2024 answer")
 	}
+}
+
+// An identical question (same vector) must be a hit at any threshold. With
+// float32 vectors RediSearch can report a cosine distance a hair below 0
+// for identical vectors; Accept rejected negative distances, so an
+// identical L2 lookup missed (found by the cache-safety evaluation).
+func TestIntegrationIdenticalVectorIsAlwaysAHit(t *testing.T) {
+	client := NewClient(redisAddr(t), "", 0)
+	defer client.Close()
+	c := newSemantic(t, client)
+	ctx := context.Background()
+	if err := c.EnsureIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(7))
+	misses, negatives := 0, 0
+	for i := 0; i < 50; i++ {
+		v := make([]float32, VectorDim)
+		for j := range v {
+			v[j] = float32(rng.NormFloat64())
+		}
+		scope := Scope{DocID: "doc", Key: fmt.Sprintf("s%d", i)}
+		if err := c.Put(ctx, scope, "same question", v, map[string]int{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]int
+		hit, ok, err := c.Get(ctx, scope, "same question", v, 0.9999, &out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			misses++
+		} else if hit.Distance < 0 {
+			negatives++
+		}
+	}
+	if misses > 0 {
+		t.Fatalf("%d of 50 identical-vector lookups missed at threshold 0.9999", misses)
+	}
+	t.Logf("identical vectors: 50/50 hits (%d reported a negative distance, clamped to 0)", negatives)
 }

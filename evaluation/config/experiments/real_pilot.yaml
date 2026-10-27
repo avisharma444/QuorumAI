@@ -1,0 +1,19 @@
+# Real-model pilot (NOT RUN). Requires the project owner's explicit approval,
+# a live backend, verified prices in config/pricing.yaml, and:
+#   python -m councileval.runner --config config/experiments/real_pilot.yaml \
+#     --authorize-paid-calls --max-requests 120 --max-spend-usd <approved amount>
+name: real-pilot
+mode: real
+api_base: http://go-backend:8080
+metrics_url: http://go-backend:9464/metrics
+dataset: data/councileval-v1
+split: heldout
+# A small stratified pilot: 6 seeded held-out items in each of 5 categories (30 items).
+categories: [extractive, unanswerable, multi_hop_bridge, multi_hop_comparison, numeric]
+per_category: 6
+strategies: [direct, council, council_deep]
+top_k: 4
+repeats: 1
+seed: 7
+retries_5xx: 0          # never re-send a request that may already have been billed
+max_output_tokens_estimate: 1024

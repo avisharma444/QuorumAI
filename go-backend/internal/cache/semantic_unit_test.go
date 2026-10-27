@@ -196,3 +196,15 @@ func TestSelectHitRules(t *testing.T) {
 		t.Fatal("no results is a plain miss")
 	}
 }
+
+func TestNegativeRoundingDistanceIsAccepted(t *testing.T) {
+	if !Accept(-1.2e-7, 0.85) || !Accept(-1.2e-7, 0.9999) {
+		t.Fatal("float32 rounding below zero must count as distance 0 (identical vectors)")
+	}
+	if Accept(-0.01, 0.85) {
+		t.Fatal("a clearly invalid negative distance must still be rejected")
+	}
+	if clampDistance(-1e-7) != 0 || clampDistance(2.5) != 2 {
+		t.Fatal("clamp")
+	}
+}

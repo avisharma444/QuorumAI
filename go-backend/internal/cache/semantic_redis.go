@@ -176,10 +176,21 @@ func NumbersMatch(a, b string) bool {
 // cosine distance: similarity = 1 - distance, so distance <= 1 - threshold.
 func MaxDistance(threshold float64) float64 { return 1 - threshold }
 
-// Accept applies the threshold rule.
+// distanceEpsilon absorbs float32 rounding in RediSearch's cosine distance:
+// identical vectors can come back as a tiny negative (or positive) distance.
+// The cache-safety evaluation found identical questions rejected because of
+// a distance like -1.2e-7.
+const distanceEpsilon = 1e-6
+
+// Accept applies the threshold rule. A slightly negative distance is
+// rounding noise for (near-)identical vectors and counts as 0; the upper
+// bound stays exact.
 func Accept(distance, threshold float64) bool {
-	return !math.IsNaN(distance) && distance >= 0 && distance <= MaxDistance(threshold)
+	return !math.IsNaN(distance) && distance >= -distanceEpsilon && distance <= MaxDistance(threshold)
 }
+
+// clampDistance maps a cosine distance into its valid range [0, 2].
+func clampDistance(d float64) float64 { return math.Min(2, math.Max(0, d)) }
 
 func (c *RedisSemanticCache) key(scope Scope, question string) string {
 	q := sha256.Sum256([]byte(question))
@@ -416,6 +427,7 @@ func SelectHit(docs []map[string]string, question string, threshold float64, des
 		if err := json.Unmarshal([]byte(d["response"]), dest); err != nil {
 			return SemanticHit{}, false, fmt.Errorf("%w: %v", ErrCorruptEntry, err)
 		}
+		score = clampDistance(score)
 		return SemanticHit{Distance: score, Similarity: 1 - score, Question: d["question"]}, true, nil
 	}
 	return SemanticHit{}, false, nil
