@@ -163,3 +163,104 @@ def test_rerank_ties_keep_vector_order():
     assert Reranker("fake", model=FakeCrossEncoder()).rerank("q", [], 3) == []
     with pytest.raises(RerankError):
         Reranker("fake", model=FakeCrossEncoder(scores=[float("inf")])).rerank("q", ["a"], 1)
+
+
+# ── failure-safe replacement: the previous index is never lost ─────
+
+OLD, NEW = DOC, ["replacement text only"]
+
+
+def _patch_modify(monkeypatch, fail_when):
+    """Make Collection.modify(name=...) raise when fail_when(current, new) is true."""
+    from chromadb.api.models.Collection import Collection
+
+    real = Collection.modify
+
+    def modify(self, *a, **k):
+        if "name" in k and fail_when(self.name, k["name"]):
+            raise RuntimeError("rename failed")
+        return real(self, *a, **k)
+    monkeypatch.setattr(Collection, "modify", modify)
+
+
+def _contents(s, doc="doc-a"):
+    return [c.content for c in s.get_all(doc)]
+
+
+def test_staging_rename_failure_restores_previous_index(store, monkeypatch):
+    store.ingest(chunks(*OLD), "doc-a")
+    final = store.collection_name("doc-a")
+    _patch_modify(monkeypatch, lambda cur, new: "_s" in cur and new == final)
+    with pytest.raises(RuntimeError, match="rename failed"):
+        store.ingest(chunks(*NEW), "doc-a")
+    monkeypatch.undo()
+    assert _contents(store) == OLD
+    assert store._names() == {final}, "no staging or backup left behind"
+    assert store.retrieve("capital", "doc-a", top_k=1, rerank=False).chunks[0].content == OLD[0]
+
+
+def test_failed_rollback_still_serves_backup_and_restart_restores_it(tmp_path, fake_embedder, monkeypatch):
+    path = str(tmp_path / "c")
+    s = ChromaStore(path, fake_embedder)
+    s.ingest(chunks(*OLD), "doc-a")
+    final = s.collection_name("doc-a")
+    # Both the swap-in and the rollback rename to the live name fail.
+    _patch_modify(monkeypatch, lambda cur, new: new == final)
+    with pytest.raises(RuntimeError):
+        s.ingest(chunks(*NEW), "doc-a")
+    assert s.exists("doc-a") and _contents(s) == OLD, "reads fall back to the backup"
+    monkeypatch.undo()
+    reopened = ChromaStore(path, fake_embedder)
+    assert reopened._names() == {final} and _contents(reopened) == OLD
+
+
+def test_failure_moving_live_index_aside_keeps_it(store, monkeypatch):
+    store.ingest(chunks(*OLD), "doc-a")
+    _patch_modify(monkeypatch, lambda cur, new: "_b" in new)
+    with pytest.raises(RuntimeError):
+        store.ingest(chunks(*NEW), "doc-a")
+    monkeypatch.undo()
+    assert _contents(store) == OLD and store._names() == {store.collection_name("doc-a")}
+
+
+def test_crash_between_renames_is_rolled_back_at_startup(tmp_path, fake_embedder):
+    path = str(tmp_path / "c")
+    s = ChromaStore(path, fake_embedder)
+    s.ingest(chunks(*OLD), "doc-a")
+    final = s.collection_name("doc-a")
+    # State after "live -> backup" but before "staging -> live": no live collection.
+    s.client.get_collection(final, embedding_function=None).modify(name=final + "_b0000abcd")
+    s.client.create_collection(final + "_s0000abcd", embedding_function=None)
+    assert _contents(s) == OLD, "reads use the backup during the gap"
+    reopened = ChromaStore(path, fake_embedder)
+    assert reopened._names() == {final} and _contents(reopened) == OLD
+
+
+def test_crash_before_backup_deletion_keeps_new_index(tmp_path, fake_embedder):
+    path = str(tmp_path / "c")
+    s = ChromaStore(path, fake_embedder)
+    s.ingest(chunks(*OLD), "doc-a")
+    final = s.collection_name("doc-a")
+    s.client.get_collection(final, embedding_function=None).modify(name=final + "_b0000abcd")
+    s.ingest(chunks(*NEW), "doc-a")  # finds only a backup: restores it, then swaps normally
+    assert _contents(s) == NEW and s._names() == {final}
+    # Swap finished but the backup was not deleted.
+    old = s.client.create_collection(final + "_b0000ffff", embedding_function=None)
+    old.add(ids=["x"], embeddings=[[0.0] * len(fake_embedder.embed_query("q"))], documents=["stale"])
+    reopened = ChromaStore(path, fake_embedder)
+    assert reopened._names() == {final} and _contents(reopened) == NEW
+
+
+def test_backup_delete_failure_does_not_fail_the_ingest(store, monkeypatch):
+    store.ingest(chunks(*OLD), "doc-a")
+    real = store.client.delete_collection
+    monkeypatch.setattr(store.client, "delete_collection", lambda name: (_ for _ in ()).throw(RuntimeError("busy")) if "_b" in name else real(name))
+    assert store.ingest(chunks(*NEW), "doc-a") == (1, True)
+    assert _contents(store) == NEW
+
+
+def test_delete_also_removes_backups(store):
+    store.ingest(chunks(*OLD), "doc-a")
+    final = store.collection_name("doc-a")
+    store.client.create_collection(final + "_b0000abcd", embedding_function=None)
+    assert store.delete("doc-a") and store._names() == set() and not store.exists("doc-a")

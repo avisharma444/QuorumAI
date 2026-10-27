@@ -14,10 +14,14 @@ Changed (correctness):
   differently punctuated IDs could share a collection.
 * Unknown documents raise DocumentNotFound. The reference opened (and so
   created) an empty collection and reported success with no chunks.
-* Re-ingesting a doc_id replaces it atomically: embeddings are computed
-  first, written to a staging collection, and only then swapped in; a
-  failure leaves the previous version untouched. The reference upserted by
-  content-derived IDs, leaving stale chunks when content changed.
+* Re-ingesting a doc_id replaces it without ever losing the previous index.
+  Embeddings are computed first and written to a staging collection. The
+  swap then renames the live collection to a backup, renames staging to the
+  live name, and only then deletes the backup. If the second rename fails,
+  the backup is renamed back; if that also fails (or the process dies
+  mid-swap), reads fall back to the backup and startup recovery restores it.
+  The reference upserted by content-derived IDs, leaving stale chunks when
+  content changed.
 * Reranking also runs when there are fewer candidates than top_k (it still
   reorders them); the reference reranked only when it had to truncate.
 """
@@ -40,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 DISTANCE_METRIC = "l2"  # Chroma default, as in the reference
 _STAGING = re.compile(r"^doc_[0-9a-f]{40}_s[0-9a-f]{8}$")
+_BACKUP = re.compile(r"^(doc_[0-9a-f]{40})_b[0-9a-f]{8}$")
 
 
 class DocumentNotFound(KeyError):
@@ -68,7 +73,7 @@ class ChromaStore:
         )
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._locks_guard = threading.Lock()
-        self._cleanup_staging()
+        self._recover()
 
     # ── naming and lookup ───────────────────────────────────────────
 
@@ -85,20 +90,67 @@ class ChromaStore:
     def _names(self) -> set[str]:
         return {c if isinstance(c, str) else c.name for c in self.client.list_collections()}
 
+    def _backups(self, final: str, names: Optional[set[str]] = None) -> list[str]:
+        names = self._names() if names is None else names
+        return sorted(n for n in names if n.startswith(final + "_b") and _BACKUP.match(n))
+
+    def _resolve(self, doc_id: str) -> Optional[str]:
+        """Name of the collection that currently holds doc_id: the live one,
+        or its backup while a replacement is mid-swap or failed to roll back."""
+        final = self.collection_name(doc_id)
+        names = self._names()
+        if final in names:
+            return final
+        backups = self._backups(final, names)
+        return backups[-1] if backups else None
+
     def _get(self, doc_id: str):
-        name = self.collection_name(doc_id)
-        if name not in self._names():
-            raise DocumentNotFound(doc_id)
-        return self.client.get_collection(name, embedding_function=None)
+        for attempt in range(2):  # a concurrent swap can rename the collection between lookup and open
+            name = self._resolve(doc_id)
+            if name is None:
+                raise DocumentNotFound(doc_id)
+            try:
+                return self.client.get_collection(name, embedding_function=None)
+            except Exception:
+                if attempt:
+                    raise
+        raise DocumentNotFound(doc_id)
 
     def exists(self, doc_id: str) -> bool:
-        return self.collection_name(doc_id) in self._names()
+        return self._resolve(doc_id) is not None
 
-    def _cleanup_staging(self) -> None:
-        for name in self._names():
+    def _recover(self) -> None:
+        """Startup: drop unfinished staging collections and finish or undo
+        any interrupted swap (a backup without a live collection is restored)."""
+        names = self._names()
+        for name in names:
             if _STAGING.match(name):
                 logger.warning("Removing leftover staging collection %s", name)
-                self.client.delete_collection(name)
+                self._drop(name)
+        for final in sorted({m.group(1) for m in map(_BACKUP.match, names) if m}):
+            self._restore(final)
+
+    def _restore(self, final: str) -> None:
+        """Make `final` hold a complete index again, preferring the live
+        collection; a backup is deleted only once `final` exists."""
+        names = self._names()
+        backups = self._backups(final, names)
+        if final not in names and backups:
+            try:
+                self.client.get_collection(backups[-1], embedding_function=None).modify(name=final)
+                logger.warning("Restored %s from backup %s", final, backups[-1])
+                backups = backups[:-1]
+            except Exception:
+                logger.exception("Could not restore %s from %s; reads use the backup", final, backups[-1])
+                return
+        for b in backups:
+            self._drop(b)
+
+    def _drop(self, name: str) -> None:
+        try:
+            self.client.delete_collection(name)
+        except Exception:
+            logger.exception("Could not delete collection %s; it is removed at next startup", name)
 
     # ── write ───────────────────────────────────────────────────────
 
@@ -127,18 +179,44 @@ class ChromaStore:
             except Exception:
                 self.client.delete_collection(staging)
                 raise
-            replaced = final in self._names()
-            if replaced:
-                self.client.delete_collection(final)
-            col.modify(name=final)
+            replaced = self._resolve(doc_id) is not None
+            self._swap(col, staging, final)
         logger.info("Ingested %d chunks for doc_id=%s (replaced=%s)", len(chunks), doc_id, replaced)
         return len(chunks), replaced
+
+    def _swap(self, col, staging: str, final: str) -> None:
+        """Replace `final` with the fully written staging collection. At every
+        step a complete index exists under `final` or under its backup."""
+        names = self._names()
+        backup = None
+        if final not in names and self._backups(final, names):
+            self._restore(final)  # an earlier swap left only a backup
+        if final in self._names():
+            backup = f"{final}_b{uuid.uuid4().hex[:8]}"
+            try:
+                self.client.get_collection(final, embedding_function=None).modify(name=backup)
+            except Exception:
+                self._restore(final)  # in case the rename half-happened
+                self._drop(staging)
+                raise
+        try:
+            col.modify(name=final)
+        except Exception:
+            if backup:
+                self._restore(final)
+            self._drop(staging)
+            raise
+        if backup:
+            self._drop(backup)
 
     def delete(self, doc_id: str) -> bool:
         with self._lock(doc_id):
             if not self.exists(doc_id):
                 return False
-            self.client.delete_collection(self.collection_name(doc_id))
+            final = self.collection_name(doc_id)
+            names = self._names()
+            for name in ([final] if final in names else []) + self._backups(final, names):
+                self.client.delete_collection(name)
             return True
 
     # ── read ────────────────────────────────────────────────────────
