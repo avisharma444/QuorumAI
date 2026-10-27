@@ -53,9 +53,10 @@ type openAIResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
+		PromptTokens     int      `json:"prompt_tokens"`
+		CompletionTokens int      `json:"completion_tokens"`
+		TotalTokens      int      `json:"total_tokens"`
+		Cost             *float64 `json:"cost"` // OpenRouter: amount charged, in credits
 	} `json:"usage"`
 	// Some gateways (including OpenRouter) can report an error inside a
 	// 200 response.
@@ -106,6 +107,9 @@ func parseOpenAIResponse(provider string, body []byte, configuredModel string) (
 	}
 	if r.Usage != nil {
 		out.Usage = Usage{PromptTokens: r.Usage.PromptTokens, CompletionTokens: r.Usage.CompletionTokens, TotalTokens: r.Usage.TotalTokens}
+		if r.Usage.Cost != nil && *r.Usage.Cost > 0 {
+			out.Usage.CostCredits = *r.Usage.Cost
+		}
 	}
 	return out, nil
 }

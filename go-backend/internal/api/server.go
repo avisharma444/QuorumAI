@@ -213,6 +213,7 @@ func addUsage(a, b *llm.Usage) *llm.Usage {
 		out.PromptTokens += a.PromptTokens
 		out.CompletionTokens += a.CompletionTokens
 		out.TotalTokens += a.TotalTokens
+		out.CostCredits += a.CostCredits
 	}
 	return &out
 }

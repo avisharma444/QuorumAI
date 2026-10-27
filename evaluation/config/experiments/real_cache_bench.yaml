@@ -1,0 +1,35 @@
+# Paired real-model benchmark: cold council vs warm L1 vs direct (+4 deep).
+# NOT RUN without the project owner's explicit approval of models and budget.
+#
+# Backend setup for the live run (all through OpenRouter, one key):
+#   MOCK_LLM=false, OPENROUTER_API_KEY=<key>, SEMANTIC_CACHE_ENABLED=false
+#   COUNCIL_1_PROVIDER=openrouter COUNCIL_1_MODEL=openai/gpt-4.1-nano
+#   COUNCIL_2_PROVIDER=openrouter COUNCIL_2_MODEL=meta-llama/llama-3.3-70b-instruct
+#   COUNCIL_3_PROVIDER=openrouter COUNCIL_3_MODEL=mistralai/mistral-small-3.2-24b-instruct
+#   CHAIRMAN_PROVIDER=openrouter  CHAIRMAN_MODEL=openai/gpt-4o-mini
+#   ROUTER_PROVIDER=openrouter    ROUTER_MODEL=openai/gpt-4.1-nano   (not called: strategies are explicit)
+#   INGESTION_PROVIDER=openrouter INGESTION_MODEL=openai/gpt-4o-mini
+#   OTEL_TRACES_EXPORTER=otlp with the tracing profile (stage timings from Jaeger)
+name: real-cache-bench
+mode: real
+api_base: http://go-backend:8080
+metrics_url: http://go-backend:9464/metrics
+dataset: data/councileval-v1
+split: heldout
+seed: 11
+# 12 answerable, document-grounded questions: straightforward, numerical, reasoning.
+per_category: {extractive: 4, numeric: 4, multi_hop_bridge: 2, multi_hop_comparison: 2}
+warm_repeats: 3
+deep_questions: 4
+top_k: 4
+max_output_tokens_estimate: 2048
+expected_models:
+  members: ["openai/gpt-4.1-nano", "meta-llama/llama-3.3-70b-instruct", "mistralai/mistral-small-3.2-24b-instruct"]
+  chairman: "openai/gpt-4o-mini"
+  ingestion: "openai/gpt-4o-mini"
+# Primary (cheapest listed) OpenRouter prices on 2026-10-27, for the LIKELY estimate only.
+likely_prices:
+  "openai/gpt-4.1-nano": [0.10, 0.40]
+  "meta-llama/llama-3.3-70b-instruct": [0.10, 0.32]
+  "mistralai/mistral-small-3.2-24b-instruct": [0.075, 0.20]
+  "openai/gpt-4o-mini": [0.15, 0.60]

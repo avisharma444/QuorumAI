@@ -373,6 +373,7 @@ func addUsage(total **llm.Usage, u *llm.Usage) {
 	(*total).PromptTokens += u.PromptTokens
 	(*total).CompletionTokens += u.CompletionTokens
 	(*total).TotalTokens += u.TotalTokens
+	(*total).CostCredits += u.CostCredits
 }
 
 // beginStage opens span "council.<name>" and returns a function that ends

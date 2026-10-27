@@ -34,10 +34,14 @@ type Response struct {
 }
 
 // Usage tracks token consumption for a single call, exactly as reported.
+// CompletionTokens counts all billed output, including reasoning/thinking
+// tokens. CostCredits is the charge the provider itself reported (OpenRouter
+// reports usage.cost in its credits); 0 means not reported.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	TotalTokens      int     `json:"total_tokens"`
+	CostCredits      float64 `json:"cost_credits,omitempty"`
 }
 
 // Reported is false when the provider sent no usage numbers at all.

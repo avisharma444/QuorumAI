@@ -476,3 +476,20 @@ func TestUsageReported(t *testing.T) {
 		t.Fatal("any non-zero field counts as reported")
 	}
 }
+
+func TestOpenRouterReportedCostAndGeminiThinkingTokens(t *testing.T) {
+	or := `{"model":"openai/gpt-4.1-nano","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"cost":0.0000123}}`
+	r, err := parseOpenAIResponse("openrouter", []byte(or), "openai/gpt-4.1-nano")
+	if err != nil || r.Usage.CostCredits != 0.0000123 || r.Usage.CompletionTokens != 5 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	r, _ = parseOpenAIResponse("openrouter", []byte(openAIOK), "x")
+	if r.Usage.CostCredits != 0 {
+		t.Fatal("cost must not be invented when the provider sent none")
+	}
+	g := `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"thoughtsTokenCount":300,"totalTokenCount":420}}`
+	gr, err := parseGeminiResponse([]byte(g), "gemini-2.5-flash")
+	if err != nil || gr.Usage.CompletionTokens != 320 || gr.Usage.PromptTokens+gr.Usage.CompletionTokens != gr.Usage.TotalTokens {
+		t.Fatalf("thinking tokens must count as billed output: %+v %v", gr.Usage, err)
+	}
+}

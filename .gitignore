@@ -39,3 +39,6 @@ evaluation/data/councileval-v1/
 evaluation/data/cache-pairs-v1/
 evaluation/results/
 **/__pycache__/
+
+# iCloud Drive placeholder files
+*.icloud

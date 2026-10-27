@@ -1,19 +1,35 @@
 # Model pricing for cost ESTIMATES (USD per million tokens).
 #
-# Only entries with verified: true are used, and a verified entry must
-# cite the provider's pricing page (source) and the date it was checked
-# (effective_date). Unverified or missing models are reported as
-# "cost unmeasured", never filled in with a guess.
+# Only verified entries are used; each cites its source and check date.
+# Unverified or missing models are reported as "cost unmeasured".
+# Real-model runs refuse to start unless every configured model is here.
 #
-# Real-model runs refuse to start unless every configured model has a
-# verified price here. Fill this in from the provider pages on the day of
-# the experiment; prices change.
-#
-# Example (NOT verified, shown for the format only):
-#   - model: "gemini:gemini-2.5-flash"     # exactly as /health reports it
-#     input_usd_per_mtok: 0.0
-#     output_usd_per_mtok: 0.0
-#     source: "https://ai.google.dev/gemini-api/docs/pricing"
-#     effective_date: "YYYY-MM-DD"
-#     verified: false
-models: []
+# These are the HIGHEST per-provider OpenRouter prices for each model on
+# 2026-10-27 (OpenRouter may route a model to any of several upstream
+# providers), so estimates and budget checks are upper bounds. Observed
+# charges come from OpenRouter's usage.cost in each response.
+models:
+  - model: "openai/gpt-4.1-nano"
+    input_usd_per_mtok: 0.11
+    output_usd_per_mtok: 0.44
+    source: "https://openrouter.ai/api/v1/models/openai/gpt-4.1-nano/endpoints"
+    effective_date: "2026-10-27"
+    verified: true
+  - model: "meta-llama/llama-3.3-70b-instruct"
+    input_usd_per_mtok: 0.72
+    output_usd_per_mtok: 2.253
+    source: "https://openrouter.ai/api/v1/models/meta-llama/llama-3.3-70b-instruct/endpoints"
+    effective_date: "2026-10-27"
+    verified: true
+  - model: "mistralai/mistral-small-3.2-24b-instruct"
+    input_usd_per_mtok: 0.10
+    output_usd_per_mtok: 0.30
+    source: "https://openrouter.ai/api/v1/models/mistralai/mistral-small-3.2-24b-instruct/endpoints"
+    effective_date: "2026-10-27"
+    verified: true
+  - model: "openai/gpt-4o-mini"
+    input_usd_per_mtok: 0.165
+    output_usd_per_mtok: 0.66
+    source: "https://openrouter.ai/api/v1/models/openai/gpt-4o-mini/endpoints"
+    effective_date: "2026-10-27"
+    verified: true

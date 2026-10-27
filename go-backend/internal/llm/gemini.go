@@ -80,6 +80,7 @@ type geminiResponse struct {
 	UsageMetadata *struct {
 		PromptTokenCount     int `json:"promptTokenCount"`
 		CandidatesTokenCount int `json:"candidatesTokenCount"`
+		ThoughtsTokenCount   int `json:"thoughtsTokenCount"` // thinking tokens, billed as output
 		TotalTokenCount      int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 	ModelVersion string `json:"modelVersion"`
@@ -156,7 +157,9 @@ func parseGeminiResponse(body []byte, model string) (*Response, error) {
 		out.Model = g.ModelVersion
 	}
 	if u := g.UsageMetadata; u != nil {
-		out.Usage = Usage{PromptTokens: u.PromptTokenCount, CompletionTokens: u.CandidatesTokenCount, TotalTokens: u.TotalTokenCount}
+		// Gemini 2.5 bills thinking tokens as output but reports them
+		// separately from candidatesTokenCount.
+		out.Usage = Usage{PromptTokens: u.PromptTokenCount, CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount, TotalTokens: u.TotalTokenCount}
 	}
 	return out, nil
 }
