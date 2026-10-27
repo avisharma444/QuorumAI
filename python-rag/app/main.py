@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="CouncilAI RAG Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="QuorumAI RAG Service", version="1.0.0", lifespan=lifespan)
 app.include_router(ingest.router, tags=["Ingestion"])
 app.include_router(retrieve.router, tags=["Retrieval"])
 app.include_router(retrieve_all.router, tags=["Retrieval"])

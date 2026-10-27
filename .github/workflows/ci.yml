@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# No job calls a model provider: Go tests use fakes and mock clients, and no
+# API keys are configured in this workflow.
+jobs:
+  go:
+    name: Go backend (vet, race tests, PostgreSQL + Redis integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis/redis-stack-server:7.4.0-v1
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: quorum
+          POSTGRES_PASSWORD: ci-only-pg-pass-7f3a91 # throwaway CI database, not a secret
+          POSTGRES_DB: quorum
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U quorum" --health-interval 5s --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: go-backend
+    env:
+      REDIS_TEST_ADDR: localhost:6379
+      REDIS_PLAIN_TEST_ADDR: localhost:6390
+      REDIS_AUTH_TEST_ADDR: localhost:6391
+      POSTGRES_TEST_URL: postgres://quorum:ci-only-pg-pass-7f3a91@localhost:5432/quorum?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go-backend/go.sum
+      - name: Throwaway Redis servers (no modules; password-protected)
+        run: |
+          docker run -d --name redis-plain -p 6390:6379 redis:7.4-alpine
+          docker run -d --name redis-auth -p 6391:6379 redis:7.4-alpine redis-server --requirepass secret
+      - name: Verify modules
+        run: go mod verify
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: Tests (race detector)
+        run: go test -race -count=1 ./...
+
+  python-rag:
+    name: Python RAG service (OCR, Chroma, real BGE + reranker models)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/hf-models
+          key: hf-bge-small-en-v1.5-ms-marco-MiniLM-L-6-v2-v1
+      - name: Build test image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build --target test -t quorumai-rag-test python-rag
+      - name: Tests
+        run: |
+          mkdir -p ~/hf-models
+          docker run --rm -v ~/hf-models:/models quorumai-rag-test
+          sudo chown -R "$(id -u):$(id -g)" ~/hf-models
+
+  evaluation:
+    name: Evaluation harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: evaluation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy pyyaml requests pytest
+      - run: python -m pytest -q tests
+
+  repo-checks:
+    name: Compose config, dashboards, UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compose file is valid (all profiles)
+        run: |
+          cp .env.example .env
+          {
+            echo "JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')"
+            echo "POSTGRES_PASSWORD=ci-only"
+            echo "GRAFANA_ADMIN_PASSWORD=ci-only"
+          } >> .env
+          docker compose --profile observability --profile tracing config -q
+          rm .env
+      - name: Grafana dashboard matches its generator
+        run: |
+          python monitoring/build_dashboard.py
+          git diff --exit-code monitoring/grafana/dashboards/
+      - name: Python sources compile
+        run: python -m py_compile ui/*.py tests/e2e_smoke.py benchmarks/*.py monitoring/*.py

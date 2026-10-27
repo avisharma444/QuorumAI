@@ -1,3 +1,7 @@
+# Fixed project name: network (councilai-reproduced_default) and volume names
+# stay the same whatever the checkout folder is called.
+name: councilai-reproduced
+
 services:
   # Internal only: no host port. The RAG service has no authentication of
   # its own, so it must only be reachable from the Go backend (which checks

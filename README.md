@@ -1,8 +1,45 @@
-# CouncilAI — runnable learning build (Phase 1)
+# QuorumAI
 
-**Status:** Working end-to-end vertical slice, **not** the full `regular-life/CouncilAI` project and **not** production-ready.
+[![CI](https://github.com/avisharma444/QuorumAI/actions/workflows/ci.yml/badge.svg)](https://github.com/avisharma444/QuorumAI/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a new, intentionally smaller implementation intended for hands-on learning and progressively measurable engineering work.
+QuorumAI answers questions with a **council of LLMs**:
+
+1. Three models draft answers in parallel.
+2. They peer-review one another anonymously.
+3. A chairman model synthesises one validated answer.
+
+Answers are grounded in your uploaded documents or the web. The system runs
+as a Go control plane and a Python RAG service, with:
+
+- two-tier Redis caching;
+- per-user authentication and document ownership;
+- Prometheus, Grafana and OpenTelemetry observability;
+- an evaluation harness that measures what the council actually buys you.
+
+**Status:** works end to end, with real-model benchmarks done. It is not
+hardened for production (see [Limitations](#limitations)).
+
+QuorumAI is an independent reimplementation of
+[regular-life/CouncilAI](https://github.com/regular-life/CouncilAI), whose
+README states the MIT license. It rebuilds that architecture with
+correctness fixes, measurements and tests. For compatibility, internal
+identifiers keep the `councilai` prefix: metric names, Redis keys, Docker
+volumes, the Compose project and the Go module path.
+
+## Measured results
+
+All numbers come from runs in this repository. Every figure carries its
+sample size, and the linked docs give method and confidence intervals.
+
+| what | result | source |
+|---|---|---|
+| L1 exact cache, real models (4 models via OpenRouter, 12 questions × 3 repeats) | cold council p50 **14.3 s** → cache hit p50 **4.1 ms**; per-question median speedup **3,811×**; 0 model calls on all 36 hits | [real_model_performance.md](docs/real_model_performance.md) |
+| council vs single model (same evidence, n = 12, exploratory) | equal accuracy; the direct call was about **5× faster and 6× cheaper** | [real_model_performance.md](docs/real_model_performance.md) |
+| benchmark cost | 76 requests, 141 model calls, **$0.017** provider-reported (cap $2.00) | [real_model_performance.md](docs/real_model_performance.md) |
+| cross-encoder reranking (n = 242) | Recall@1 **0.760 → 0.851**; but multi-hop all-evidence@3 **0.782 → 0.655** | [evaluation.md](docs/evaluation.md) |
+| semantic (L2) cache safety, held-out pairs | at threshold 0.85, **65% false-positive rate** (true-positive rate 0.910), so L2 answer reuse is **off by default** | [evaluation.md](docs/evaluation.md) |
+| load test, mock models (k6, 20 VUs) | L1-hit p95 **≈12 ms**, 0% application failures; mock latencies are not model latencies | [performance.md](docs/performance.md) |
 
 ## What works now
 
@@ -13,26 +50,28 @@ Reference architecture: <https://github.com/regular-life/CouncilAI>. This is a n
 - **Concurrent council:** configurable 3 LLM models, parallel candidate generation, parallel peer reviews, chairman synthesis, defensive fallbacks, optional reflection/revision.
 - **Response streaming:** SSE events (`start`, `retrieved`, `candidate`, `review`, `final`; plus errors/fallbacks).
 - **Python FastAPI RAG service (reference architecture):** document inspection → adaptive extraction (PyPDF2 text layer, pdfplumber layout/tables, Tesseract OCR for images and scanned PDFs) → layout-aware chunks (tables kept whole, headings attached, captions grouped) → `BAAI/bge-small-en-v1.5` embeddings (mean pooling, 384-D, CPU) → persistent **ChromaDB** collection per document → `cross-encoder/ms-marco-MiniLM-L-6-v2` reranking of 3×k vector candidates. Endpoints: `/ingest`, `/retrieve`, `/retrieve-all`, `/embed`, `/search`, `/health` (liveness), `/ready` (models loaded).
-- **Persistence:** Chroma data in the `chroma-data` volume; model weights in the `councilai-hf` volume (downloaded once). Re-uploading identical bytes replaces that document atomically.
+- **Persistence:** Chroma data in the `chroma-data` volume; model weights in the `councilai-hf` volume (downloaded once). Re-uploading identical bytes replaces that document without ever losing the previous index. The new index is written to a staging collection; the swap keeps a backup, rolls back if the rename fails, and is completed or undone on startup after a crash.
 - **Redis Stack caching (reference architecture):** L1 exact cache (JSON in Redis, 1 h TTL, hashed versioned keys), L2 semantic cache (RediSearch FLAT/COSINE/FLOAT32 384-D index `idx:semantic_cache`, KNN `FT.SEARCH`, 24 h TTL, threshold 0.85; **answer reuse off by default**, see below) and document summaries (`councilai:v4:doc_summary:<id>`), all behind one circuit breaker (3 failures → open, 10 s cooldown, 1 half-open probe, 2 successes → closed). Caching is an optimisation: when Redis is down nothing is cached in-process. Rate limiting fails **closed** by default (503 while Redis is unreachable, so model spending is never unmetered); `RATE_LIMIT_FAILURE_POLICY=open` restores the reference behaviour.
 - **Observability:** Prometheus metrics (`client_golang`) on an internal-only port, Grafana dashboard (22 panels, provisioned), OpenTelemetry tracing in Go and Python with W3C `traceparent` propagation and an optional Jaeger backend, and k6 load-test profiles. See [Observability](#observability) and [docs/performance.md](docs/performance.md).
 - **Streamlit UI:** register/login/logout, conversation sessions with history and clear, document upload, model stages, candidate/review inspection.
 - **Safe default testing:** `MOCK_LLM=true` runs without model API keys, using clearly identified mock answers.
-- **Tests:** Go unit tests (including parallel execution and SSE), Python ingestion/retrieval tests, an HTTP latency benchmark, and a real two-service smoke-test script.
+- **Tests and CI:** GitHub Actions runs Go race tests against real PostgreSQL and Redis Stack, the Python RAG suite (OCR plus the real BGE and reranker models), the evaluation harness tests, and repository checks. A two-service smoke test and HTTP benchmarks run locally.
 
-### Deliberately NOT implemented yet
+### Limitations
 
-- Real-model answer-quality, calibration and cost results (the harness exists; paid runs need approval), quality improvement claims
-- Alerting rules, log aggregation, metrics for the Python service (it is traced, not scraped)
-- Roles/admin users, document sharing between users, deleting documents, token revocation (tokens stay valid until they expire), password reset
-- Documents uploaded before authentication existed have no owner and are therefore not reachable through the API
-- Provider retries/rate budgets, production deployment and hardening
+- **Quality evidence is small.** The real-model comparison covers 12 easy, document-grounded questions; there the council matched a single model at about 5× the latency and 6× the cost. A larger, harder set is needed before claiming any quality gain.
+- **L2 semantic answer reuse is unsafe** with these embeddings (near-miss questions such as "enable / disable 2FA" score as paraphrases), so it is off by default.
+- **Reranking helps single-hop questions but hurts multi-hop evidence coverage** at k = 3.
+- **No production operations:** no alerting rules, log aggregation, Python service metrics, provider retries or per-user spend budgets.
+- **Accounts:** no roles or admin users, document sharing, document deletion API, token revocation (tokens stay valid until they expire) or password reset.
+- **Legacy documents:** documents uploaded before authentication existed have no owner, so the API cannot reach them.
 
 **Retrieval notes:** embeddings are mean-pooled and not normalised (as in the reference), and Chroma uses L2 distance, so `vector_distance` is a raw distance, not a similarity. Cross-encoder `rerank_score` values are raw logits for ordering, not probabilities. Text-layer PDFs extracted with PyPDF2 produce one block per page, so their chunks can be large; PDFs with tables go through pdfplumber, which keeps paragraphs, tables and captions in page order. Multi-column reading order is not reconstructed. The starter's hashed-vector/SQLite retrieval survives only as a benchmark baseline in `python-rag/app/baselines/`.
 
 ## Quick start: Docker on Mac M2
 
 ```bash
+git clone https://github.com/avisharma444/QuorumAI.git && cd QuorumAI
 cp .env.example .env
 # Required secrets (never commit .env):
 echo "JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')" >> .env
@@ -299,7 +338,7 @@ OTEL_TRACES_EXPORTER=otlp docker compose --profile observability --profile traci
   and counted in `councilai_telemetry_errors_total` without affecting
   requests. Python tracing is an extension: the reference traced Go only.
 - **Grafana** uses the provisioned `Prometheus` data source and the
-  `CouncilAI` dashboard (`monitoring/grafana/dashboards/councilai.json`,
+  provisioned dashboard (`monitoring/grafana/dashboards/councilai.json`,
   generated by `monitoring/build_dashboard.py`). There is no default
   password: Grafana refuses to start without `GRAFANA_ADMIN_PASSWORD`.
 - **Load tests** (`tests/load/load_test.js`, k6): profiles `reference`
@@ -346,11 +385,29 @@ N=20 python benchmarks/benchmark_http.py
 
 **Interpretation:** In mock mode, latency figures measure HTTP/orchestration/cache overhead without real model inference. They must **not** be reported as actual multi-LLM speedups. Query-quality comparisons require reference answers and a labeled dataset; a council is not automatically more accurate than a single model.
 
-## Next engineering milestones
+## Roadmap
 
-1. **Phase 2: Actual semantic RAG.** Implement persistent ChromaDB + local MiniLM embeddings; evaluate recall@k/MRR and exact document-grounding failures against the lexical baseline.
-2. **Phase 3: Shared caching.** Go Redis client, L1 exact + Redis Stack RediSearch VSS cache, document-scope isolation, circuit breaker, meaningful p50/p95 cache metrics.
-3. **Phase 4: Hardening.** Auth, per-user document ownership, conversation memory, rate limiting, metrics, tracing and mock-model load tests are done; remaining: retries with bounded budgets, token revocation, alerting, real-model load tests.
-4. **Phase 5: Model-quality experiment.** Curate held-out document questions, use identical retrieved evidence for single-model vs council, score with manual/source-grounded rubric and report cost/latency/accuracy tradeoffs.
+**Done:**
+- Go council with streaming
+- layout-aware RAG with OCR, ChromaDB and reranking
+- L1 and L2 Redis caches behind a circuit breaker
+- PostgreSQL and JWT authentication with per-user documents, conversations and rate limiting
+- metrics, tracing, dashboards and k6 load tests
+- the evaluation harness, and a budget-guarded real-model benchmark
 
-See [BUILD_PLAN.md](BUILD_PLAN.md) for measurable acceptance criteria.
+**Next:**
+1. **Quality study that can tell council from direct:** a larger, harder held-out set; alias-aware scoring; blinded manual review; cost and latency per correct answer.
+2. **Safer semantic reuse:** an answer-equivalence check (for example an entailment model) before L2 reuse, re-measured on the held-out pair set.
+3. **Multi-hop retrieval:** keep evidence diversity when reranking (for example MMR, or reserving top vector hits), measured by all-evidence@k.
+4. **Provider resilience and spend control:** bounded retries, fallback models, per-user token budgets.
+5. **Real-model load test** under a fixed budget, to measure provider tail latency under concurrency.
+6. **Operations:** alerting rules, Python service metrics, token revocation, a document deletion API.
+
+[BUILD_PLAN.md](BUILD_PLAN.md) records the original phase plan and its
+acceptance criteria.
+
+## License
+
+[MIT](LICENSE) © 2026 avisharma444. QuorumAI reimplements the architecture of
+[regular-life/CouncilAI](https://github.com/regular-life/CouncilAI), which
+its README lists as MIT.

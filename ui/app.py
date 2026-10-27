@@ -1,4 +1,4 @@
-"""Streamlit interface for CouncilAI: login, conversations, documents and
+"""Streamlit interface for QuorumAI: login, conversations, documents and
 the full deliberation trace. All API calls carry the user's Bearer token."""
 import json
 import os
@@ -7,9 +7,9 @@ import requests
 import streamlit as st
 
 API = os.getenv("API_URL", "http://localhost:8080").rstrip("/")
-st.set_page_config(page_title="CouncilAI Starter", page_icon="🧠", layout="wide")
-st.title("🧠 CouncilAI — Deliberation Lab")
-st.caption("Phase-1 implementation: Go concurrent council + Python document retrieval. Mock mode generates illustrative, not factual, answers.")
+st.set_page_config(page_title="QuorumAI", page_icon="🧠", layout="wide")
+st.title("🧠 QuorumAI — Deliberation Lab")
+st.caption("Go concurrent council + Python document retrieval. Mock mode generates illustrative, not factual, answers.")
 for key, default in {"doc_id": "", "token": "", "username": "", "session_id": ""}.items():
     if key not in st.session_state:
         st.session_state[key] = default

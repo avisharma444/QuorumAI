@@ -1,4 +1,4 @@
-// Command server runs the CouncilAI Go backend.
+// Command server runs the QuorumAI Go backend.
 package main
 
 import (
@@ -240,7 +240,7 @@ func startMetricsServer(addr string) *http.Server {
 }
 
 func main() {
-	log.Println("Starting CouncilAI Go backend")
+	log.Println("Starting QuorumAI Go backend")
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Configuration error:\n%v", err)
