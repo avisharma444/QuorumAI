@@ -1,0 +1,29 @@
+# Experiment-only overrides: QuorumAI end-to-end with Phi-4-mini on RunPod as
+# council member 3 (docs/runpod_vllm_deployment.md). The production defaults
+# (config.yaml, MOCK_LLM=true in .env) are untouched; restarting without this
+# file restores them.
+#
+#   docker compose -f docker-compose.yml -f deploy/runpod/compose.e2e.yml up -d go-backend
+#
+# VLLM_API_KEY is interpolated by Compose from RUNPOD_API_KEY in .env (the
+# restricted, endpoint-scoped key), so no key is copied anywhere. Do not run
+# `docker compose config` with this file: it would print the interpolated key.
+services:
+  go-backend:
+    environment:
+      - MOCK_LLM=false
+      - SEMANTIC_CACHE_ENABLED=false
+      - COUNCIL_1_PROVIDER=openrouter
+      - COUNCIL_1_MODEL=openai/gpt-4.1-nano
+      - COUNCIL_2_PROVIDER=openrouter
+      - COUNCIL_2_MODEL=meta-llama/llama-3.3-70b-instruct
+      - COUNCIL_3_PROVIDER=local
+      - COUNCIL_3_MODEL=microsoft/Phi-4-mini-instruct
+      - VLLM_MICROSOFT_PHI_4_MINI_INSTRUCT_URL=https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID:?set RUNPOD_ENDPOINT_ID in .env}/openai/v1/chat/completions
+      - VLLM_API_KEY=${RUNPOD_API_KEY:?set RUNPOD_API_KEY in .env}
+      - CHAIRMAN_PROVIDER=openrouter
+      - CHAIRMAN_MODEL=openai/gpt-4o-mini
+      - ROUTER_PROVIDER=openrouter
+      - ROUTER_MODEL=openai/gpt-4.1-nano
+      - INGESTION_PROVIDER=openrouter
+      - INGESTION_MODEL=openai/gpt-4o-mini

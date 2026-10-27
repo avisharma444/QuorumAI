@@ -275,8 +275,8 @@ func TestRankingMapsCorrectlyWhenACandidateFails(t *testing.T) {
 		"member/b":    {Err: errProvider},
 		"member/c":    {Text: "answer from c"},
 		"review/a":    ranking("B, A"),
-		"review/b":    ranking("B, A"),
-		"review/c":    ranking("A, B"),
+		"review/b":    ranking("A, B"), // must never be used: b's candidate failed
+		"review/c":    ranking("B, A"),
 		"chair/chair": {Err: errProvider},
 	})
 	res, log := mustRun(t, f, "council")
@@ -287,11 +287,11 @@ func TestRankingMapsCorrectlyWhenACandidateFails(t *testing.T) {
 	if strings.Contains(f.Prompt("review", "a"), "Response C") {
 		t.Fatal("failed candidate must not appear in the review prompt")
 	}
-	// Reviewer b's own answer failed, but it still reviews (reference behaviour).
-	if len(res.Reviews) != 3 || f.Count("review") != 3 {
-		t.Fatalf("expected 3 reviewer slots, got %d", len(res.Reviews))
+	// Member b's own answer failed, so it is not asked to review.
+	if len(res.Reviews) != 2 || f.Count("review") != 2 || f.Prompt("review", "b") != "" {
+		t.Fatalf("expected reviews from a and c only, got %d", len(res.Reviews))
 	}
-	if res.Selected != "B" || res.Answer != "answer from c" || res.Candidates[1].Score != 5 {
+	if res.Selected != "B" || res.Answer != "answer from c" || res.Candidates[1].Score != 4 {
 		t.Fatalf("wrong mapping: %+v", res)
 	}
 	if !log.has("candidate") || !log.has("fallback") {
@@ -616,6 +616,93 @@ func TestEvidenceIsLabelledByKind(t *testing.T) {
 		}
 		if tc.grounding == "web" && strings.Contains(f.Prompt("member", "a"), "Document excerpts") {
 			t.Fatal("web results must not be presented as document excerpts")
+		}
+	}
+}
+
+// A member whose candidate failed is not asked to review. The reviews that
+// do run keep configuration order and configured slots, the failure is
+// reported in the result and the stream, and the chairman labels reviewers by
+// their configured slot.
+func TestFailedMemberIsNotAskedToReview(t *testing.T) {
+	f := llmtest.New(map[string]llmtest.Reply{
+		"member/a": {Err: errProvider},
+		"member/b": {Text: "answer from b"},
+		"member/c": {Text: "answer from c"},
+		"review/a": ranking("A, B"),
+		"review/b": ranking("B, A"),
+		"review/c": ranking("B, A"),
+	})
+	// Finish c's review before b's so slice order cannot come from timing.
+	f.Hook = func(ctx context.Context, stage, model string) error {
+		if stage == "review" && model == "b" {
+			time.Sleep(50 * time.Millisecond)
+		}
+		return nil
+	}
+	res, log := mustRun(t, f, "council")
+	if f.Prompt("review", "a") != "" || f.Count("review") != 2 {
+		t.Fatalf("failed member a was asked to review (%d review calls)", f.Count("review"))
+	}
+	if len(res.Reviews) != 2 || res.Reviews[0].Reviewer != "b" || res.Reviews[0].Index != 1 ||
+		res.Reviews[1].Reviewer != "c" || res.Reviews[1].Index != 2 {
+		t.Fatalf("review order/slots: %+v", res.Reviews)
+	}
+	if res.Selected != "B" || res.Source != "chairman:chair" || !res.PeerReviewed || len(res.Degraded) != 0 {
+		t.Fatalf("unexpected: %+v", res)
+	}
+	if len(res.FailedCandidates) != 1 || res.FailedCandidates[0].Model != "a" || res.FailedCandidates[0].Error == "" || res.FailedCandidates[0].Label != "" {
+		t.Fatalf("failure not reported: %+v", res.FailedCandidates)
+	}
+	chair := f.Prompt("chair", "chair")
+	if strings.Contains(chair, "--- Reviewer 1 ---") || !strings.Contains(chair, "--- Reviewer 2 ---") || !strings.Contains(chair, "--- Reviewer 3 ---") {
+		t.Fatalf("chairman reviewer labels:\n%s", chair)
+	}
+	var skipped []any
+	log.mu.Lock()
+	for i, n := range log.names {
+		if n == "review_skipped" {
+			skipped = append(skipped, log.values[i])
+		}
+	}
+	log.mu.Unlock()
+	if len(skipped) != 1 {
+		t.Fatalf("want one review_skipped event, got %v", skipped)
+	}
+	if m := skipped[0].(map[string]any); m["reviewer"] != "a" || m["index"] != 0 {
+		t.Fatalf("skip event %v", m)
+	}
+}
+
+// Skipping a failed member's review does not change the existing fallbacks:
+// if the reviews that do run are all unusable, the longest candidate wins.
+func TestSkippedReviewerStillFallsBackWhenRemainingReviewsFail(t *testing.T) {
+	f := llmtest.New(map[string]llmtest.Reply{
+		"member/a": {Text: "short"},
+		"member/b": {Err: errProvider},
+		"member/c": {Text: "the longest candidate answer"},
+		"review/a": {Err: errProvider},
+		"review/c": {Text: "no ranking here"},
+	})
+	res, _ := mustRun(t, f, "council")
+	if res.Source != "c (peer-review-failed-fallback)" || f.Count("chair") != 0 || len(res.Reviews) != 2 || f.Prompt("review", "b") != "" {
+		t.Fatalf("unexpected: %+v", res)
+	}
+	if len(res.FailedCandidates) != 1 || res.FailedCandidates[0].Model != "b" {
+		t.Fatalf("failure not reported: %+v", res.FailedCandidates)
+	}
+}
+
+// With every member healthy nothing is skipped and every member reviews.
+func TestNoReviewSkippedWhenAllCandidatesSucceed(t *testing.T) {
+	f := llmtest.New(nil)
+	res, log := mustRun(t, f, "council")
+	if f.Count("review") != 3 || len(res.Reviews) != 3 || res.FailedCandidates != nil || log.has("review_skipped") {
+		t.Fatalf("unexpected: %+v", res)
+	}
+	for i, r := range res.Reviews {
+		if r.Index != i {
+			t.Fatalf("review %d has slot %d", i, r.Index)
 		}
 	}
 }

@@ -42,3 +42,6 @@ evaluation/results/
 
 # iCloud Drive placeholder files
 *.icloud
+
+# RunPod deployment state (endpoint/template ids; never keys)
+deploy/runpod/state/

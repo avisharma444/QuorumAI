@@ -295,7 +295,8 @@ if st.button("Ask council", type="primary", disabled=not question.strip()):
                         else:
                             st.text(ch.get("content", ""))
             with st.expander("Candidate responses"):
-                for c in result.get("candidates", []):
+                # Failed members (no label, not asked to peer-review) follow the survivors.
+                for c in result.get("candidates", []) + result.get("failed_candidates", []):
                     label = f"Response {c['label']} — " if c.get("label") else ""
                     score = f" (peer score {c['score']})" if c.get("score") else ""
                     st.markdown(f"**{label}{c['model']}**{score}")

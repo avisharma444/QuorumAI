@@ -122,3 +122,43 @@ func TestEmptySlotsAreSkipped(t *testing.T) {
 		t.Fatalf("got %d members", len(clients.Members))
 	}
 }
+
+// The experiment layout: two hosted members, Phi-4-mini on RunPod Serverless,
+// chairman unchanged. The RunPod key comes from VLLM_API_KEY and never
+// appears in the startup summary.
+func TestRunPodMemberConfiguration(t *testing.T) {
+	// Per-model endpoint overrides are read from the process environment.
+	t.Setenv("VLLM_MICROSOFT_PHI_4_MINI_INSTRUCT_URL", "https://api.runpod.ai/v2/abc123xyz/openai/v1/chat/completions")
+	cfg := load(t, map[string]string{
+		"COUNCIL_1_PROVIDER": "openrouter", "COUNCIL_1_MODEL": "openai/gpt-4.1-nano",
+		"COUNCIL_2_PROVIDER": "openrouter", "COUNCIL_2_MODEL": "meta-llama/llama-3.3-70b-instruct",
+		"COUNCIL_3_PROVIDER": "local", "COUNCIL_3_MODEL": "microsoft/Phi-4-mini-instruct",
+		"CHAIRMAN_PROVIDER": "openrouter", "CHAIRMAN_MODEL": "openai/gpt-4o-mini",
+		"ROUTER_PROVIDER": "openrouter", "ROUTER_MODEL": "openai/gpt-4.1-nano",
+		"INGESTION_PROVIDER": "openrouter", "INGESTION_MODEL": "openai/gpt-4o-mini",
+		"OPENROUTER_API_KEY": secret, "VLLM_API_KEY": "rp-" + secret,
+	})
+	clients, err := buildClients(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok := clients.Members[2].(*llm.VLLMClient)
+	if !ok || v.ModelName() != "local:microsoft/Phi-4-mini-instruct" {
+		t.Fatalf("member 3 %T %v", clients.Members[2], clients.Members[2].ModelName())
+	}
+	summary := strings.Join(startupSummary(cfg, clients), "\n")
+	if !strings.Contains(summary, "Member 3: local:microsoft/Phi-4-mini-instruct [vLLM on RunPod Serverless endpoint abc123xyz, bearer auth]") {
+		t.Fatalf("summary:\n%s", summary)
+	}
+	if strings.Contains(summary, secret) {
+		t.Fatal("startup summary leaks a key")
+	}
+	// Without the key the RunPod member is a startup error naming the variable.
+	cfg = load(t, map[string]string{
+		"COUNCIL_1_PROVIDER": "local", "COUNCIL_1_MODEL": "microsoft/Phi-4-mini-instruct",
+		"OPENROUTER_API_KEY": secret, "GEMINI_API_KEY": secret,
+	})
+	if _, err := buildClients(cfg); err == nil || !strings.Contains(err.Error(), "VLLM_API_KEY") {
+		t.Fatalf("want missing-key error, got %v", err)
+	}
+}

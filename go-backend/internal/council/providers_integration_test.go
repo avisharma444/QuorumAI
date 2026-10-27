@@ -215,11 +215,15 @@ func TestMixedProviderPartialFailure(t *testing.T) {
 	if len(res.Candidates) != 2 || res.Candidates[1].Model != "gemini:gemini-test" || res.Candidates[1].Label != "B" {
 		t.Fatalf("candidates %+v", res.Candidates)
 	}
-	// NIM's answer failed but it still reviewed; B = 2+2+1 = 5 beats A = 4.
+	// NIM's answer failed, so it does not review (its scripted "A, B" is
+	// never used); B = 2+2 = 4 beats A = 2.
 	if res.Selected != "B" || res.Answer != "Gemini answer" || res.Source != "gemini:gemini-test (chairman-failed-fallback)" || res.Reflection != nil {
 		t.Fatalf("result %+v", res)
 	}
-	if res.TokenUsage.TotalTokens != 15*5 { // 2 candidates + 3 reviews; failed calls report nothing
+	if len(res.Reviews) != 2 || res.Candidates[1].Score != 4 || len(res.FailedCandidates) != 1 || res.FailedCandidates[0].Model != "nim:nim/model" {
+		t.Fatalf("reviews %+v failed %+v", res.Reviews, res.FailedCandidates)
+	}
+	if res.TokenUsage.TotalTokens != 15*4 { // 2 candidates + 2 reviews; failed calls report nothing
 		t.Fatalf("usage %+v", res.TokenUsage)
 	}
 }
@@ -326,5 +330,149 @@ func TestEveryStageSendsMaxTokensOnTheWire(t *testing.T) {
 	}
 	if got := srv.body("direct")["max_tokens"]; got != float64(llm.DefaultMaxOutputTokens) {
 		t.Fatalf("default cap not applied: %v", got)
+	}
+}
+
+// ── Remote vLLM (RunPod Serverless) as one council member ──────────
+
+// failedCandidate returns the streamed candidate event for model, which is
+// where a failed member is reported (results keep only survivors).
+func failedCandidate(t *testing.T, log *eventLog, model string) Candidate {
+	t.Helper()
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for i, n := range log.names {
+		if c, ok := log.values[i].(Candidate); ok && n == "candidate" && c.Model == model {
+			return c
+		}
+	}
+	t.Fatalf("no candidate event for %s", model)
+	return Candidate{}
+}
+
+const runPodRoute = "/v2/ep-test/openai/v1/chat/completions"
+const runPodKey = "rp-test-SECRET-key-42"
+
+// runPodMember serves the RunPod OpenAI route in front of a stage server and
+// rejects requests without the bearer key, like the RunPod gateway.
+func runPodMember(t *testing.T, inner http.Handler) (*llm.VLLMClient, *httptest.Server) {
+	t.Helper()
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != runPodRoute || r.Header.Get("Authorization") != "Bearer "+runPodKey {
+			http.Error(w, `{"error":"Unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(gw.Close)
+	c, err := llm.NewVLLMClientWithKey(gw.URL+runPodRoute, runPodKey, "microsoft/Phi-4-mini-instruct", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, gw
+}
+
+// hostedPair returns two OpenRouter-shaped members; ranking is the review
+// they give ("A, B, C" with three candidates, "A, B" when one failed).
+func hostedPair(t *testing.T, ranking string) []llm.LLMClient {
+	a := newStageServer(t, false, script(replies{"member": "hosted answer A", "review": "RANKING: " + ranking + "\nREASONING: ok"}))
+	b := newStageServer(t, false, script(replies{"member": "hosted answer B", "review": "RANKING: " + ranking + "\nREASONING: ok"}))
+	return []llm.LLMClient{
+		llm.NewOpenRouterClient(fakeKey, a.URL+"/api/v1/chat/completions", "openai/gpt-4.1-nano", 5*time.Second),
+		llm.NewOpenRouterClient(fakeKey, b.URL+"/api/v1/chat/completions", "meta-llama/llama-3.3-70b-instruct", 5*time.Second),
+	}
+}
+
+func chairFor(t *testing.T) llm.LLMClient {
+	s := newStageServer(t, false, script(replies{"chair": `{"answer":"synthesis","reasoning":"r","source":"chairman-synthesis"}`}))
+	return llm.NewOpenRouterClient(fakeKey, s.URL+"/api/v1/chat/completions", "openai/gpt-4o-mini", 5*time.Second)
+}
+
+func TestRunPodVLLMMemberGeneratesReviewsAndReportsUsage(t *testing.T) {
+	phi := newStageServer(t, false, script(replies{"member": "phi answer", "review": "RANKING: C, A, B\nREASONING: ok"}))
+	member, _ := runPodMember(t, phi.Config.Handler)
+	c := New(append(hostedPair(t, "A, B, C"), member), chairFor(t), 5*time.Second)
+	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, Evidence{}, nil)
+	if err != nil || res.Answer != "synthesis" || len(res.Degraded) != 0 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	cand := res.Candidates[2]
+	if cand.Model != "local:microsoft/Phi-4-mini-instruct" || cand.ServedModel != "served:microsoft/Phi-4-mini-instruct" ||
+		cand.Answer != "phi answer" || cand.Usage == nil || cand.Usage.CompletionTokens != 5 {
+		t.Fatalf("phi candidate %+v", cand)
+	}
+	if r := res.Reviews[2]; r.Error != "" || r.Reviewer != "local:microsoft/Phi-4-mini-instruct" || r.Usage == nil {
+		t.Fatalf("phi review %+v", r)
+	}
+	if got := strings.Join(sortedCopy(phi.seen()), ","); got != "member,review" {
+		t.Fatalf("phi saw %s", got)
+	}
+	if res.TokenUsage == nil || res.TokenUsage.TotalTokens != 7*15 {
+		t.Fatalf("usage %+v", res.TokenUsage)
+	}
+}
+
+func TestRunPodVLLMMemberTimeoutFallsBackToTwoMembers(t *testing.T) {
+	cancelled := make(chan struct{}, 8)
+	stuck := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done() // cold start longer than the stage timeout
+		cancelled <- struct{}{}
+	})
+	member, _ := runPodMember(t, stuck)
+	c := New(append(hostedPair(t, "A, B"), member), chairFor(t), 300*time.Millisecond)
+	log := &eventLog{}
+	start := time.Now()
+	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, Evidence{}, log.emit)
+	if err != nil || res.Answer != "synthesis" {
+		t.Fatalf("council should still answer: %+v %v", res, err)
+	}
+	// The failed member is not asked to review, so a dead endpoint costs one
+	// stage timeout, not two, and the endpoint sees exactly one request.
+	if el := time.Since(start); el < 300*time.Millisecond || el >= 600*time.Millisecond {
+		t.Fatalf("expected about one stage timeout, took %s", el)
+	}
+	if len(res.FailedCandidates) != 1 || !strings.Contains(res.FailedCandidates[0].Error, "deadline exceeded") {
+		t.Fatalf("phi failure not reported: %+v", res.FailedCandidates)
+	}
+	if len(res.Candidates) != 2 || len(res.Reviews) != 2 || res.Reviews[0].Error != "" || res.Reviews[1].Error != "" || !res.PeerReviewed {
+		t.Fatalf("want the 2 hosted members to carry on: %+v", res)
+	}
+	if e := failedCandidate(t, log, "local:microsoft/Phi-4-mini-instruct").Error; !strings.Contains(e, "deadline exceeded") || strings.Contains(e, runPodKey) {
+		t.Fatalf("phi candidate error %q", e)
+	}
+	select {
+	case <-cancelled: // the abandoned request was closed, not left running
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote request was not cancelled")
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("the failed member was sent a second (review) request")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRunPodVLLMMemberBadKeyIsAReportedFailure(t *testing.T) {
+	phi := newStageServer(t, false, script(replies{"member": "never"}))
+	_, gw := runPodMember(t, phi.Config.Handler)
+	wrong, err := llm.NewVLLMClientWithKey(gw.URL+runPodRoute, "wrong-key", "microsoft/Phi-4-mini-instruct", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(append(hostedPair(t, "A, B"), wrong), chairFor(t), 5*time.Second)
+	log := &eventLog{}
+	res, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "council"}, Evidence{}, log.emit)
+	if err != nil || res.Answer != "synthesis" || len(res.Candidates) != 2 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if e := failedCandidate(t, log, "local:microsoft/Phi-4-mini-instruct").Error; !strings.Contains(e, "401") || strings.Contains(e, "wrong-key") {
+		t.Fatalf("phi candidate error %q", e)
+	}
+	if len(phi.seen()) != 0 {
+		t.Fatal("request without a valid key reached the model")
+	}
+	if len(res.Reviews) != 2 || log.has("review_error") {
+		t.Fatalf("rejected member must not be asked to review: %+v", res.Reviews)
 	}
 }

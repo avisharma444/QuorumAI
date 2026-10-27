@@ -1,0 +1,23 @@
+# QuorumAI end-to-end with Phi-4-mini on RunPod as council member 3.
+# NOT RUN without the owner's explicit approval. Backend env: see
+# docs/runpod_vllm_deployment.md ("Backend configuration for the experiment").
+name: runpod-e2e
+api_base: http://go-backend:8080
+dataset: data/councileval-v1
+split: heldout
+seed: 23
+per_category: {extractive: 2, numeric: 2, multi_hop_bridge: 2, multi_hop_comparison: 2}   # 8 selected: 6 councils + 1 cancel
+deep_questions: 0
+questions: 6                     # reduced from 8 to fit the $2.00 GPU cap at the RTX 4090 rate
+cancel_after_councils: true      # 7th question: the cancellation test, same session and warm worker
+top_k: 4
+max_output_tokens_estimate: 1024   # backend LLM_MAX_OUTPUT_TOKENS: worst case per hosted call
+client_timeout_s: 180
+served_model: microsoft/Phi-4-mini-instruct
+warmup_allocation_timeout_s: 480 # async warm-up job: wait at most 8 min for a worker
+warmup_init_timeout_s: 600       # then at most 10 min for model initialization and the answer
+cancel_after_s: 3                  # cancel phase: client gives up mid-council
+cancel_observe_samples: 10         # RunPod /health samples, 2 s apart
+expected_models:
+  members: ["openai/gpt-4.1-nano", "meta-llama/llama-3.3-70b-instruct", "local:microsoft/Phi-4-mini-instruct"]
+  chairman: "openai/gpt-4o-mini"

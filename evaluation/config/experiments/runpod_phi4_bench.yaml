@@ -1,0 +1,130 @@
+# GPU inference benchmark: microsoft/Phi-4-mini-instruct on RunPod Serverless
+# (official vLLM worker). NOT RUN without the owner's explicit approval.
+# Deployment steps and settings: docs/runpod_vllm_deployment.md
+# Provisioning: deploy/runpod/runpod_deploy.py (reads the endpoint section below)
+#
+# Environment (never committed):
+#   RUNPOD_ENDPOINT_ID        endpoint ID (not a secret)
+#   RUNPOD_API_KEY            Restricted key: Read/Write on THIS endpoint only
+#   RUNPOD_READONLY_API_KEY   optional Read Only key: settings check, GPU type, billing
+name: runpod-phi4-bench
+api_base: https://api.runpod.ai
+
+model:
+  hf_id: microsoft/Phi-4-mini-instruct
+  revision: cfbefacb99257ffa30c83adab238a50856ac3083   # HF main on 2026-10-27; MIT, not gated
+  served_name: microsoft/Phi-4-mini-instruct
+  params_billion: 3.8
+  weights_gb_bf16: 7.67
+
+gpu:
+  # 2026-10-27: changed from L4 / A5000 / 3090 (owner-approved). The first
+  # attempt waited 1,200 s in the queue with no worker allocated: none of
+  # those types had capacity. RTX 4090 only, for one consistent GPU type.
+  class: "24 GB PRO (RTX 4090, Ada sm_89), one GPU per worker"
+  allowed: ["NVIDIA GeForce RTX 4090"]
+
+price_usd_per_hour:
+  value: 1.10            # RunPod Serverless "24 GB PRO" (RTX 4090); the 24 GB L4/A5000/3090 tier was $0.69
+  source: https://www.runpod.io/pricing
+  checked: "2026-10-27"
+  verified: true
+
+# Identical for every benchmark request.
+generation:
+  max_tokens: 256
+  temperature: 0.0
+  seed: 1234
+  ignore_eos: true       # fixed 256-token outputs so throughput is comparable across levels
+
+endpoint:
+  # Every deployment setting, explicit. deploy/runpod/runpod_deploy.py creates
+  # exactly this, and gpu_bench --check-endpoint verifies the live endpoint
+  # against it.
+  name: quorumai-phi4-bench                 # endpoint; looked up by exact name, so re-runs never duplicate it
+  template_name: quorumai-phi4-vllm-v2.28.0 # serverless template; looked up by exact name
+  endpoint_type: queue                      # queue-based Serverless (the REST create default; no load balancer)
+  compute_type: GPU
+  # v2.29.0 was never published (its release build failed on 2026-10-07; the
+  # registry returns 404), so the nearest older published release is pinned.
+  image: runpod/worker-v1-vllm:v2.28.0      # vLLM 0.30.0, CUDA 13.0 (released 2026-09-28)
+  image_digest: sha256:6d8e4ff417e09aeffe6a55e547ed81203b02228533c5305e726caaa7dab34571  # deploy refuses if the tag moves
+  container_disk_gb: 30                     # image layers live outside it; holds the 7.7 GB weights + caches
+  network_volume: none                      # weights download to the container disk on each cold start
+  data_center_ids: any                      # no restriction (REST default: all data centres)
+  gpu_count: 1
+  max_workers: 1
+  min_workers: 0
+  idle_timeout_s: 30
+  execution_timeout_s: 120
+  flashboot: true
+  scaler_type: QUEUE_DELAY                  # REST default, written out
+  scaler_value: 4                           # seconds a request may queue before scaling (irrelevant at max 1 worker)
+  cold_start_allowance_s: 600              # max billed model initialization; also the startup init timeout below
+  # An EXACT set, not a minimum. 2026-10-27: "13.0" alone matched no
+  # Serverless host (4090 and A5000 hosts advertise 13.2), so both earlier
+  # attempts never placed a worker. The image needs CUDA >= 13.0, and newer
+  # drivers run it (the same fix as runpod-workers/worker-vllm#362). Owner-approved.
+  allowed_cuda_versions: ["13.0", "13.1", "13.2", "13.3", "13.4"]
+  # Exact type list (REST gpuTypeIds). RTX 4090 is the only member of RunPod's
+  # ADA_24 serverless pool. Same architecture family as the L4 (Ada, sm_89),
+  # supported by the CUDA 13.0 image.
+  gpu_type_ids: ["NVIDIA GeForce RTX 4090"]
+  env:
+    MODEL_NAME: microsoft/Phi-4-mini-instruct
+    MODEL_REVISION: cfbefacb99257ffa30c83adab238a50856ac3083
+    MAX_MODEL_LEN: 4096
+    GPU_MEMORY_UTILIZATION: 0.90
+    MAX_NUM_SEQS: 16
+    MAX_CONCURRENCY: 16
+    DTYPE: bfloat16
+    ENABLE_PREFIX_CACHING: "false"           # keep repeated prompts from skewing TTFT
+
+phases:
+  request_timeout_s: 120   # = the endpoint's execution timeout (RunPod stops a job there anyway)
+  suggested_max_wall_s: 1680
+  # Cold start as an async job (/run + /status): RunPod's synchronous routes
+  # stop waiting after ~90 s, which a cold start can exceed. Replaces the
+  # earlier synchronous "cold" request (same count: 1).
+  startup:
+    max_tokens: 8
+    allocation_timeout_s: 480   # wait at most 8 min for RunPod to allocate a worker (queue time is not billed)
+    init_timeout_s: 600         # from allocation: container start + 7.7 GB weights + load + answer (= cold_start_allowance_s)
+    poll_s: 2
+  # 1-token async jobs on the warm worker: RunPod executionTime = time inside
+  # the worker, an upper bound on in-engine TTFT (compare with gateway TTFT).
+  worker_timing:
+    requests: 8           # one per prompt
+    max_tokens: 1
+    timeout_s: 120
+    poll_s: 0.5
+  warm:
+    requests: 20
+  concurrency:
+    levels: [1, 2, 4, 8]
+    requests_per_level: 16
+  failures:
+    - {kind: invalid_key}                    # rejected by RunPod before any worker
+    - {kind: wrong_model}
+    - {kind: prompt_too_long, repeat: 900}   # ~5,400+ tokens > MAX_MODEL_LEN 4096
+    - {kind: client_timeout, timeout_s: 2}
+    - {kind: client_cancel, after_chunks: 5, observe_s: 15}
+
+# Fixed prompts (original text written for this benchmark).
+prompts:
+  - id: p1
+    text: "Explain, in plain language for a new engineer, how a message queue decouples a producer service from a consumer service. Cover buffering during traffic spikes, retries when the consumer fails, and why ordering guarantees are harder to keep when there are several consumers."
+  - id: p2
+    text: "A warehouse has three loading docks. Trucks arrive every 12 minutes on average and each takes 30 minutes to unload. Describe step by step how you would estimate whether trucks will queue, what extra information you would want, and what simple change would most reduce waiting time."
+  - id: p3
+    text: "Write a short technical note comparing caching at the HTTP edge with caching inside an application process. Discuss invalidation, consistency between replicas, memory pressure, and one situation where each approach is the wrong choice."
+  - id: p4
+    text: "Summarise the trade-offs of storing time-series sensor readings in a relational database versus an append-only log on object storage. Consider write throughput, ad-hoc queries, retention policies, and cost over three years."
+  - id: p5
+    text: "You are reviewing a pull request that adds retries to every outbound API call with a fixed one-second delay. List the risks you would raise, propose a safer retry policy, and explain how you would test it before it reaches production."
+  - id: p6
+    text: "Describe how a library catalogue could detect duplicate book records that differ in punctuation, author name order, or edition notes. Propose a matching approach, how to measure its precision and recall, and how humans would resolve uncertain matches."
+  - id: p7
+    text: "Explain why the average response time of a web service can look healthy while many users still have a poor experience. Introduce percentiles, describe what tail latency usually comes from, and suggest two metrics a team should alert on."
+  - id: p8
+    text: "A small team must choose between running a database themselves on virtual machines and using a managed database service. Lay out the operational responsibilities in each case, the failure scenarios that matter most, and how you would make the decision."

@@ -1,0 +1,38 @@
+# One GPU budget for every phase that can reach the RunPod endpoint
+# (councileval/gpu_budget.py). Both gpu_bench and e2e_vllm refuse to run
+# without it, and they record each session in the same ledger file, so the
+# caps hold across processes. NOT RUN without the owner's explicit approval.
+#
+# Worst case per session = (session wall cap + cold-start allowance
+#   + execution timeout + idle timeout) x price, because max workers = 1:
+#   a worker may still be loading after an abort, a job the gateway did not
+#   cancel may run to the execution timeout, then the worker idles.
+#
+# 2026-10-27 revision (owner-approved): RTX 4090 at $1.10/h. Fitting the
+# unchanged $2.00 cap needed:
+#   - startup = 480 s allocation wait + 600 s model init (was 1,200 s in total);
+#   - 120 s request timeouts (= endpoint execution timeout);
+#   - 6 councils instead of 8;
+#   - the cancellation test inside the council session (no second warm-up).
+# History (the first attempt's 1 request and its released reservation) stays
+# in the ledger; the request cap below includes it.
+name: runpod-phi4-campaign
+ledger: results/gpu_budget/runpod-phi4-campaign.json
+price_usd_per_hour: 1.10          # RunPod Serverless 24 GB PRO (RTX 4090), runpod.io/pricing, 2026-10-27
+idle_timeout_s: 30
+cold_start_allowance_s: 600
+execution_timeout_s: 120
+
+max_gpu_requests: 120             # owner cap; 1 already used by the first (cancelled) attempt
+max_gpu_wall_s: 4240              # = sum of the sessions below
+max_gpu_spend_usd: 2.00           # owner cap; plan worst case is $1.98
+
+sessions:
+  # 1 startup job + 8 worker-timing jobs + 20 warm + 4 x 16 concurrency + 5 failure probes;
+  # wall: 480 s allocation + 600 s init + 600 s for the measured phases
+  gpu_bench:    {gpu_requests: 98, max_wall_s: 1680}
+  # 1 warm-up job + 6 councils x 2 Phi calls + cancellation test (<= 2 Phi calls)
+  # wall: 1,080 s warm-up + 7 x 180 s client timeout + 20 s cancel observation
+  e2e_council:  {gpu_requests: 15, max_wall_s: 2360}
+  # 1 council x 2 Phi calls with a wrong key (rejected at the gateway, still counted)
+  e2e_fallback: {gpu_requests: 2,  max_wall_s: 200}

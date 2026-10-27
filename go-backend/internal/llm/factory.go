@@ -25,6 +25,7 @@ type ProviderKeys struct {
 	Gemini     string
 	OpenRouter string
 	NVIDIANim  string
+	VLLM       string // optional bearer token for remote vLLM (e.g. RunPod Serverless)
 }
 
 // ProviderURLs holds provider endpoints.
@@ -78,6 +79,7 @@ func NewClientFromProvider(provider, model string, keys ProviderKeys, urls Provi
 	case ProviderLocal:
 		// Each local model can have its own server:
 		// VLLM_MICROSOFT_PHI_4_MINI_INSTRUCT_URL overrides urls.VLLM.
+		// VLLM_<MODEL>_API_KEY likewise overrides VLLM_API_KEY.
 		vllmURL := os.Getenv(VLLMURLEnvKey(model))
 		if vllmURL == "" {
 			vllmURL = urls.VLLM
@@ -85,7 +87,11 @@ func NewClientFromProvider(provider, model string, keys ProviderKeys, urls Provi
 		if vllmURL == "" {
 			vllmURL = DefaultVLLMURL
 		}
-		return NewVLLMClient(vllmURL, model, timeout), nil
+		key := os.Getenv(VLLMKeyEnvKey(model))
+		if key == "" {
+			key = keys.VLLM
+		}
+		return NewVLLMClientWithKey(vllmURL, key, model, timeout)
 
 	default:
 		return nil, fmt.Errorf("unknown provider %q for model %s (valid: gemini, openrouter, nvidia-nim, local)", provider, model)
@@ -96,6 +102,12 @@ func NewClientFromProvider(provider, model string, keys ProviderKeys, urls Provi
 // e.g. "microsoft/Phi-4-mini-instruct" → VLLM_MICROSOFT_PHI_4_MINI_INSTRUCT_URL.
 func VLLMURLEnvKey(model string) string {
 	return "VLLM_" + normalizeModelName(model) + "_URL"
+}
+
+// VLLMKeyEnvKey is the per-model bearer-token variable for model, e.g.
+// "microsoft/Phi-4-mini-instruct" → VLLM_MICROSOFT_PHI_4_MINI_INSTRUCT_API_KEY.
+func VLLMKeyEnvKey(model string) string {
+	return "VLLM_" + normalizeModelName(model) + "_API_KEY"
 }
 
 // normalizeModelName converts a model identifier to an uppercase, env-safe

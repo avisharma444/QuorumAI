@@ -49,6 +49,7 @@ type Config struct {
 	GeminiAPIKey     string
 	GeminiURL        string
 	NVIDIANimAPIKey  string
+	VLLMAPIKey       string // optional bearer token for a remote vLLM endpoint
 	NVIDIANimURL     string
 	VLLMURL          string
 
@@ -136,7 +137,7 @@ type RedisConfig struct {
 
 // Keys returns the provider credentials.
 func (c *Config) Keys() llm.ProviderKeys {
-	return llm.ProviderKeys{Gemini: c.GeminiAPIKey, OpenRouter: c.OpenRouterAPIKey, NVIDIANim: c.NVIDIANimAPIKey}
+	return llm.ProviderKeys{Gemini: c.GeminiAPIKey, OpenRouter: c.OpenRouterAPIKey, NVIDIANim: c.NVIDIANimAPIKey, VLLM: c.VLLMAPIKey}
 }
 
 // URLs returns the provider endpoints.
@@ -290,6 +291,7 @@ func LoadFrom(path string, getenv func(string) string) (*Config, error) {
 	cfg.OpenRouterAPIKey = getenv("OPENROUTER_API_KEY")
 	cfg.GeminiAPIKey = getenv("GEMINI_API_KEY")
 	cfg.NVIDIANimAPIKey = getenv("NVIDIA_NIM_API_KEY")
+	cfg.VLLMAPIKey = getenv("VLLM_API_KEY")
 	cfg.OpenRouterURL = l.str("OPENROUTER_URL", y.Providers.OpenRouterURL, "https://openrouter.ai/api/v1/chat/completions")
 	cfg.GeminiURL = l.str("GEMINI_URL", y.Providers.GeminiURL, llm.DefaultGeminiURL)
 	cfg.NVIDIANimURL = l.str("NVIDIA_NIM_URL", y.Providers.NVIDIANimURL, "https://integrate.api.nvidia.com/v1/chat/completions")

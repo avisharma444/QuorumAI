@@ -1,0 +1,8 @@
+# Fallback test only: layered on top of compose.e2e.yml, this gives the
+# backend a key RunPod rejects, so member 3 fails and the council must answer
+# with the two hosted members.
+#   docker compose -f docker-compose.yml -f deploy/runpod/compose.e2e.yml -f deploy/runpod/compose.e2e-wrongkey.yml up -d go-backend
+services:
+  go-backend:
+    environment:
+      - VLLM_API_KEY=invalid-key-for-fallback-test

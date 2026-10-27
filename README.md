@@ -244,7 +244,9 @@ The old variables `MODEL_API_KEY`, `MODEL_BASE_URL`, `COUNCIL_MODELS`,
 `CHAIR_MODEL` and `RAG_URL` are rejected with a pointer to their replacements.
 
 Check provider pricing first. A complete council request makes 7+ model calls
-(3 candidates + 3 peer reviews + chairman; more in deep mode). Responses
+(3 candidates + 3 peer reviews + chairman; more in deep mode). A member
+whose candidate failed is not asked to review; it is listed in
+`failed_candidates`, and the stream gets a `review_skipped` event. Responses
 include provider-reported token usage per call and in total (`token_usage`).
 
 ### Caching: what is cached, and the semantic threshold

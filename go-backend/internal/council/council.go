@@ -86,7 +86,10 @@ type QueryResult struct {
 	PeerReviewed bool        `json:"peer_reviewed"`
 	Selected     string      `json:"selected,omitempty"` // label of the top peer-ranked candidate
 	Candidates   []Candidate `json:"candidates,omitempty"`
-	Reviews      []Review    `json:"reviews,omitempty"`
+	// FailedCandidates are members whose answer failed, in configuration
+	// order, with the error. They get no label and are not asked to review.
+	FailedCandidates []Candidate `json:"failed_candidates,omitempty"`
+	Reviews          []Review    `json:"reviews,omitempty"`
 	// Reasoning and Confidence come from the structured chairman (or
 	// revision) output that produced Answer. Confidence is the model's own
 	// claim, nil when it gave none; it is not a calibrated probability.
@@ -466,12 +469,17 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 	}
 
 	// Stage 1: every member answers in parallel. Survivors keep configuration
-	// order and get anonymous labels A, B, C... in that order.
-	for _, cand := range c.generateCandidates(ctx, historyBlock(q.History)+prompt, sources, emit) {
+	// order and get anonymous labels A, B, C... in that order. Failed members
+	// are kept in FailedCandidates so the final result reports them.
+	var reviewers []int // configured slots of members whose candidate succeeded
+	for i, cand := range c.generateCandidates(ctx, historyBlock(q.History)+prompt, sources, emit) {
 		addUsage(&result.TokenUsage, cand.Usage)
 		if cand.Error == "" {
 			cand.Label = labelFor(len(result.Candidates))
 			result.Candidates = append(result.Candidates, cand)
+			reviewers = append(reviewers, i)
+		} else {
+			result.FailedCandidates = append(result.FailedCandidates, cand)
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -484,8 +492,12 @@ func (c *Council) Run(ctx context.Context, q QueryRequest, ev Evidence, emit Eve
 		return fallback(result.Candidates[0], "single-response", "only one model succeeded; skipping peer review and chairman")
 	}
 
-	// Stage 2: every configured member ranks the anonymous candidates.
-	result.Reviews = c.peerReview(ctx, q.Question, result.Candidates, emit)
+	// Stage 2: members whose candidate succeeded rank the anonymous candidates.
+	// A member that just failed (dead endpoint, timeout, bad key) is not asked
+	// again: that would cost a second stage timeout for a review that almost
+	// certainly fails too. This deliberately differs from the reference, which
+	// asked every configured member.
+	result.Reviews = c.peerReview(ctx, q.Question, result.Candidates, reviewers, emit)
 	for _, r := range result.Reviews {
 		addUsage(&result.TokenUsage, r.Usage)
 	}
@@ -567,10 +579,23 @@ func (c *Council) generateCandidates(ctx context.Context, prompt string, sources
 	return out
 }
 
-func (c *Council) peerReview(ctx context.Context, question string, cands []Candidate, emit EventFn) []Review {
+// peerReview asks the members at the given configured slots (in configuration
+// order) to rank cands. Review.Index stays the configured slot; the returned
+// slice is in the same order as reviewers. Every other member gets a
+// "review_skipped" event and no call.
+func (c *Council) peerReview(ctx context.Context, question string, cands []Candidate, reviewers []int, emit EventFn) []Review {
 	ctx, end := beginStage(ctx, "peer_review")
 	prompt := reviewPrompt(question, cands)
-	reviews := make([]Review, len(c.Members))
+	reviews := make([]Review, len(reviewers))
+	asked := make(map[int]bool, len(reviewers))
+	for _, i := range reviewers {
+		asked[i] = true
+	}
+	for i, member := range c.Members {
+		if !asked[i] {
+			emit("review_skipped", map[string]any{"index": i, "reviewer": member.ModelName(), "reason": "candidate generation failed"})
+		}
+	}
 	defer func() {
 		failed := 0
 		for _, r := range reviews {
@@ -581,9 +606,9 @@ func (c *Council) peerReview(ctx context.Context, question string, cands []Candi
 		end(stageOutcome(failed, len(reviews)))
 	}()
 	var wg sync.WaitGroup
-	for i, member := range c.Members {
+	for slot, i := range reviewers {
 		wg.Add(1)
-		go func(i int, member llm.LLMClient) {
+		go func(slot, i int, member llm.LLMClient) {
 			defer wg.Done()
 			start := time.Now()
 			resp, err := c.call(ctx, "review", member, reviewSystem, prompt, nil)
@@ -599,13 +624,13 @@ func (c *Council) peerReview(ctx context.Context, question string, cands []Candi
 					r.Ranking, r.Scores = rankingLabels(ranking), scoreRanking(ranking)
 				}
 			}
-			reviews[i] = r
+			reviews[slot] = r
 			if r.Error != "" {
 				emit("review_error", r)
 			} else {
 				emit("review", r)
 			}
-		}(i, member)
+		}(slot, i, c.Members[i])
 	}
 	wg.Wait()
 	return reviews

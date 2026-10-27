@@ -12,7 +12,7 @@ import requests
 _REDACT = [
     (re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [redacted]"),
     (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted-jwt]"),
-    (re.compile(r"\b(sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|nvapi-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,})"), "[redacted-key]"),
+    (re.compile(r"\b(sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|nvapi-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|rpa_[A-Za-z0-9]{16,})"), "[redacted-key]"),
     (re.compile(r'("?(?:password|api[_-]?key|token|secret)"?\s*[:=]\s*)"?[^",\s}]+', re.I), r"\1[redacted]"),
 ]
 

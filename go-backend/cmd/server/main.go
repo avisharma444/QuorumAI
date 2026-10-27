@@ -95,15 +95,45 @@ func startupSummary(cfg *config.Config, clients pipelineClients) []string {
 		lines = append(lines, "MOCK_LLM=true: offline mock clients; configured providers are not contacted")
 	}
 	for i, m := range clients.Members {
-		lines = append(lines, fmt.Sprintf("  Member %d: %s", i+1, m.ModelName()))
+		lines = append(lines, fmt.Sprintf("  Member %d: %s", i+1, describe(m)))
 	}
 	lines = append(lines,
-		"Chairman: "+clients.Chairman.ModelName(),
-		"Router: "+clients.Router.ModelName(),
-		"Ingestion summarizer: "+clients.Ingestion.ModelName(),
+		"Chairman: "+describe(clients.Chairman),
+		"Router: "+describe(clients.Router),
+		"Ingestion summarizer: "+describe(clients.Ingestion),
 		fmt.Sprintf("Web search grounding for questions without a document: %t", cfg.WebSearch),
 	)
 	return lines
+}
+
+// describe names a client's model and, for vLLM, its endpoint (no secrets).
+func describe(c llm.LLMClient) string {
+	if v, ok := c.(*llm.VLLMClient); ok {
+		return fmt.Sprintf("%s [%s]", v.ModelName(), v.Describe())
+	}
+	return c.ModelName()
+}
+
+// probeVLLMEndpoints logs one readiness probe per distinct vLLM endpoint in
+// the background. It never blocks or fails startup: an endpoint scaled to
+// zero is normal for RunPod Serverless, and a request still gets the usual
+// timeout and council fallback if the endpoint is down.
+func probeVLLMEndpoints(clients pipelineClients) {
+	seen := map[string]bool{}
+	all := append(append([]llm.LLMClient{}, clients.Members...), clients.Chairman, clients.Router, clients.Ingestion)
+	for _, c := range all {
+		v, ok := c.(*llm.VLLMClient)
+		if !ok || seen[v.URL()] {
+			continue
+		}
+		seen[v.URL()] = true
+		go func(v *llm.VLLMClient) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			r := v.Readiness(ctx)
+			log.Printf("[vLLM] %s: ready=%t (%s)", v.ModelName(), r.Ready, r.Detail)
+		}(v)
+	}
 }
 
 // setupRedis wires the Redis Stack caches. Redis is an optimisation: if it
@@ -322,6 +352,9 @@ func main() {
 
 	for _, line := range startupSummary(cfg, clients) {
 		log.Println(line)
+	}
+	if !cfg.MockLLM {
+		probeVLLMEndpoints(clients)
 	}
 	log.Printf("Listening on :%s", cfg.ServerPort)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
