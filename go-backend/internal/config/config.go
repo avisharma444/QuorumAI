@@ -61,6 +61,10 @@ type Config struct {
 	StageTimeout   time.Duration // per model call inside a council stage
 	LLMTimeout     time.Duration // HTTP client timeout for council members
 	RequestTimeout time.Duration // whole query
+
+	// MaxOutputTokens caps every council model call (candidates, reviews,
+	// chairman, direct, revision) that does not set a smaller cap itself.
+	MaxOutputTokens int
 }
 
 // ObservabilityConfig: Prometheus endpoint and OpenTelemetry tracing.
@@ -317,6 +321,10 @@ func LoadFrom(path string, getenv func(string) string) (*Config, error) {
 	cfg.StageTimeout = l.duration("STAGE_TIMEOUT", y.Council.Timeouts.Stage, 30*time.Second)
 	cfg.LLMTimeout = l.duration("LLM_TIMEOUT", y.Council.Timeouts.LLM, 120*time.Second)
 	cfg.RequestTimeout = l.duration("REQUEST_TIMEOUT", y.Council.Timeouts.Request, 120*time.Second)
+	cfg.MaxOutputTokens = l.integer("LLM_MAX_OUTPUT_TOKENS", 0, llm.DefaultMaxOutputTokens)
+	if cfg.MaxOutputTokens <= 0 {
+		l.fail("LLM_MAX_OUTPUT_TOKENS must be a positive integer, got %d", cfg.MaxOutputTokens)
+	}
 
 	redisDefault := true
 	if y.Redis.Enabled != nil {

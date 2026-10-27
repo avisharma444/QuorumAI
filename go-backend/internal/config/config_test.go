@@ -44,6 +44,9 @@ func TestLoadsRepositoryConfig(t *testing.T) {
 	if cfg.StageTimeout != 30*time.Second || cfg.LLMTimeout != 120*time.Second || cfg.RequestTimeout != 120*time.Second {
 		t.Fatalf("timeouts %s %s %s", cfg.StageTimeout, cfg.LLMTimeout, cfg.RequestTimeout)
 	}
+	if cfg.MaxOutputTokens != 1024 {
+		t.Fatalf("default output cap %d", cfg.MaxOutputTokens)
+	}
 	if cfg.OpenRouterURL != "https://openrouter.ai/api/v1/chat/completions" || cfg.MockLLM {
 		t.Fatalf("providers %+v", cfg)
 	}
@@ -56,7 +59,7 @@ func TestEnvironmentOverridesEachSlotIndependently(t *testing.T) {
 		"COUNCIL_3_PROVIDER": "local", "COUNCIL_3_MODEL": "microsoft/Phi-4-mini-instruct",
 		"CHAIRMAN_PROVIDER": "openrouter", "CHAIRMAN_MODEL": "anthropic/claude-x",
 		"ROUTER_MODEL":  "gemini-2.5-flash-lite",
-		"STAGE_TIMEOUT": "12s", "REQUEST_TIMEOUT": "90s",
+		"STAGE_TIMEOUT": "12s", "REQUEST_TIMEOUT": "90s", "LLM_MAX_OUTPUT_TOKENS": "600",
 		"OPENROUTER_API_KEY": "or-key", "GEMINI_API_KEY": "g-key",
 		"NVIDIA_NIM_URL": "https://nim.internal/v1/chat/completions",
 		"MOCK_LLM":       "false",
@@ -75,6 +78,9 @@ func TestEnvironmentOverridesEachSlotIndependently(t *testing.T) {
 	}
 	if cfg.StageTimeout != 12*time.Second || cfg.RequestTimeout != 90*time.Second || cfg.LLMTimeout != 120*time.Second {
 		t.Fatal("timeout overrides")
+	}
+	if cfg.MaxOutputTokens != 600 {
+		t.Fatalf("output cap override %d", cfg.MaxOutputTokens)
 	}
 	keys, urls := cfg.Keys(), cfg.URLs()
 	if keys.OpenRouter != "or-key" || keys.Gemini != "g-key" || keys.NVIDIANim != "" || urls.NVIDIANim != "https://nim.internal/v1/chat/completions" {
@@ -118,6 +124,8 @@ func TestInvalidConfigurationIsReportedNotDefaulted(t *testing.T) {
 		"negative duration":    {"council:\n  timeouts:\n    llm: \"-5s\"\n", map[string]string{"COUNCIL_1_MODEL": "m"}, "LLM_TIMEOUT"},
 		"bad council size":     {"", map[string]string{"COUNCIL_1_MODEL": "m", "COUNCIL_SIZE": "lots"}, "COUNCIL_SIZE"},
 		"council size too big": {"", map[string]string{"COUNCIL_1_MODEL": "m", "COUNCIL_SIZE": "27"}, "between 1 and 26"},
+		"zero output cap":      {"", map[string]string{"COUNCIL_1_MODEL": "m", "LLM_MAX_OUTPUT_TOKENS": "0"}, "LLM_MAX_OUTPUT_TOKENS"},
+		"bad output cap":       {"", map[string]string{"COUNCIL_1_MODEL": "m", "LLM_MAX_OUTPUT_TOKENS": "big"}, "LLM_MAX_OUTPUT_TOKENS"},
 		"bad MOCK_LLM":         {"", map[string]string{"COUNCIL_1_MODEL": "m", "MOCK_LLM": "yes please"}, "MOCK_LLM"},
 		"unsupported member":   {"", map[string]string{"COUNCIL_2_PROVIDER": "openai", "COUNCIL_2_MODEL": "gpt"}, `council member 2: unsupported provider "openai"`},
 		"unsupported chairman": {"", map[string]string{"COUNCIL_1_MODEL": "m", "CHAIRMAN_PROVIDER": "anthropic"}, `chairman: unsupported provider "anthropic"`},

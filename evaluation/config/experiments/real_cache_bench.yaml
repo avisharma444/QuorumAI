@@ -9,7 +9,9 @@
 #   CHAIRMAN_PROVIDER=openrouter  CHAIRMAN_MODEL=openai/gpt-4o-mini
 #   ROUTER_PROVIDER=openrouter    ROUTER_MODEL=openai/gpt-4.1-nano   (not called: strategies are explicit)
 #   INGESTION_PROVIDER=openrouter INGESTION_MODEL=openai/gpt-4o-mini
+#   LLM_MAX_OUTPUT_TOKENS=1024 (max_tokens on every council call; reflection 500, router/ingestion 200)
 #   OTEL_TRACES_EXPORTER=otlp with the tracing profile (stage timings from Jaeger)
+# Before the run: python -m councileval.openrouter_key --max-limit-usd 2.00 --need-usd 2.00
 name: real-cache-bench
 mode: real
 api_base: http://go-backend:8080
@@ -22,7 +24,8 @@ per_category: {extractive: 4, numeric: 4, multi_hop_bridge: 2, multi_hop_compari
 warm_repeats: 3
 deep_questions: 4
 top_k: 4
-max_output_tokens_estimate: 2048
+max_output_tokens_estimate: 2048   # worst-case budget assumption, above the enforced cap
+output_token_cap: 1024             # preflight fails if any call reports more output tokens
 expected_models:
   members: ["openai/gpt-4.1-nano", "meta-llama/llama-3.3-70b-instruct", "mistralai/mistral-small-3.2-24b-instruct"]
   chairman: "openai/gpt-4o-mini"

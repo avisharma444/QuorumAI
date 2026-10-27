@@ -1,8 +1,8 @@
-# Real-model benchmark: plan and dry run (not yet executed)
+# Real-model benchmark: plan and dry run
 
-Status: **prepared, awaiting the owner's approval.** No external inference has
-been run. The results report (`docs/real_model_performance.md`) will be
-written only from an approved live run.
+Status: **approved and executed on 2026-10-27.** Results are in
+[real_model_performance.md](real_model_performance.md). This page keeps the
+plan and dry run as they were approved.
 
 ## Procedure (`evaluation/councileval/cache_bench.py`)
 
@@ -53,6 +53,23 @@ cost (or its worst case when any call lacked usage), charges every ingestion
 its worst case (the summarizer's usage is not returned by `/ingest`), and
 charges an unexpected warm cache miss as a full council. The run aborts if
 `/health` stops reporting exactly the pinned models.
+
+## Safety gates added after approval
+
+- **Output caps on the wire.** Every council call now sends `max_tokens`:
+  `LLM_MAX_OUTPUT_TOKENS` (default 1024) unless the stage sets a smaller cap
+  (reflection 500, router and ingestion summary 200). Before this change the
+  candidate, review, chairman, direct and revision calls sent no cap.
+  `TestEveryStageSendsMaxTokensOnTheWire` checks the HTTP request bodies.
+- **Provider-side key limit.** `python -m councileval.openrouter_key
+  --max-limit-usd 2.00 --need-usd 2.00` reads the key's limit from
+  OpenRouter's key-metadata endpoint (no model call) and refuses a key with
+  no limit or one above $2.00.
+- **Live preflight.** The first cold council and its first warm repeat must
+  pass: 3 candidates + 3 reviews + parsed chairman JSON from the pinned
+  models, per-call token usage and reported cost, no call above the output
+  cap, Prometheus +7 calls cold and +0 warm, an `l1_exact` hit with the same
+  answer, L2 `disabled_by_policy`. Any failure is recorded and stops the run.
 
 ## Validation without provider calls
 

@@ -90,7 +90,7 @@ func buildClients(cfg *config.Config) (pipelineClients, error) {
 
 // startupSummary describes the configuration without credentials.
 func startupSummary(cfg *config.Config, clients pipelineClients) []string {
-	lines := []string{fmt.Sprintf("Config file: %q | RAG: %s | stage timeout %s, request timeout %s", cfg.ConfigFile, cfg.RAGServiceURL, cfg.StageTimeout, cfg.RequestTimeout)}
+	lines := []string{fmt.Sprintf("Config file: %q | RAG: %s | stage timeout %s, request timeout %s, max output tokens %d", cfg.ConfigFile, cfg.RAGServiceURL, cfg.StageTimeout, cfg.RequestTimeout, cfg.MaxOutputTokens)}
 	if cfg.MockLLM {
 		lines = append(lines, "MOCK_LLM=true: offline mock clients; configured providers are not contacted")
 	}
@@ -259,7 +259,9 @@ func main() {
 		}
 	}()
 
-	srv := api.NewServer(council.New(clients.Members, clients.Chairman, cfg.StageTimeout), cfg.RAGServiceURL)
+	cn := council.New(clients.Members, clients.Chairman, cfg.StageTimeout)
+	cn.MaxOutputTokens = cfg.MaxOutputTokens
+	srv := api.NewServer(cn, cfg.RAGServiceURL)
 	srv.RequestTimeout = cfg.RequestTimeout
 	srv.Router = agent.NewRouter(clients.Router)
 	srv.IngestAgent = agent.NewIngestAgent(clients.Ingestion)

@@ -17,7 +17,10 @@ L2 semantic reuse must be disabled (checked on every response).
 
 Safety (mode=real): /health must report llm.mode == "live" AND exactly the
 pinned `expected_models` (checked before every question; a change aborts the
-run); --authorize-paid-calls, --max-requests and --max-spend-usd are
+run); the first cold council and its first warm repeat are a live preflight
+(full council, pinned/served models, per-call usage and reported cost, output
+tokens within the cap, parsed chairman JSON, Prometheus 7/0 calls, L1 hit),
+and any failure stops the run; --authorize-paid-calls, --max-requests and --max-spend-usd are
 required; every model needs a verified price. A BudgetGuard refuses any
 request whose worst case could exceed the caps, charging each finished
 request its provider-reported cost when every call reported one, otherwise
@@ -67,6 +70,10 @@ class WarmInferenceError(RuntimeError):
     pass
 
 
+class PreflightError(RuntimeError):
+    pass
+
+
 # ── configuration and question selection ─────────────────────────────
 
 def load_config(path: Path) -> dict:
@@ -80,6 +87,7 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("seed", 11)
     cfg.setdefault("deep_questions", 4)
     cfg.setdefault("max_output_tokens_estimate", 2048)
+    cfg.setdefault("output_token_cap", 1024)  # the backend's LLM_MAX_OUTPUT_TOKENS
     cfg.setdefault("metrics_url", None)
     cfg.setdefault("jaeger_url", None)
     cfg.setdefault("likely", {})
@@ -166,6 +174,74 @@ def reported_cost(resp: Optional[dict]) -> Optional[float]:
     if model_calls(resp) and not u.get("cost_credits"):
         return None
     return float(u.get("cost_credits") or 0.0)
+
+
+def preflight_failures(cold: dict, warm: Optional[dict], cfg: dict) -> list[str]:
+    """Live preflight on the first scheduled cold council and its first warm
+    repeat. Any failure stops the whole run before further paid requests."""
+    f = []
+    r = cold.get("response") or {}
+    c = cold.get("classification") or {}
+    if cold.get("status") != 200:
+        f.append(f"cold request status {cold.get('status')}: {cold.get('error')}")
+        return f
+    if c.get("tier") != "none" or not c.get("inference"):
+        f.append(f"cold request was not an uncached inference: {c}")
+    if c.get("degraded"):
+        f.append(f"cold council degraded: {r.get('degraded')}")
+    if c.get("l2") != "disabled_by_policy":
+        f.append(f"L2 semantic reuse not disabled: {c.get('l2')}")
+    m = cfg["expected_models"]
+    cands, reviews = r.get("candidates") or [], r.get("reviews") or []
+    if len(cands) != len(m["members"]) or any(x.get("error") for x in cands):
+        f.append(f"expected {len(m['members'])} successful candidates, got {[(x.get('model'), x.get('error')) for x in cands]}")
+    if len(reviews) != len(m["members"]) or any(x.get("error") for x in reviews):
+        f.append(f"expected {len(m['members'])} successful reviews, got {[(x.get('reviewer'), x.get('error')) for x in reviews]}")
+    syn = r.get("synthesis") or {}
+    if syn.get("status") != "synthesized" or not (r.get("answer") or "").strip():
+        f.append(f"chairman did not return parsed structured output: {syn}")
+    if syn.get("model") != m["chairman"]:
+        f.append(f"chairman model {syn.get('model')} is not {m['chairman']}")
+    for x in cands + reviews:
+        name = x.get("model") or x.get("reviewer") or ""
+        if name not in m["members"] or not served_ok(name, x.get("served_model")):
+            f.append(f"unexpected model: requested {name}, served {x.get('served_model')}")
+    cap = cfg["output_token_cap"]
+    per_call = 0
+    for x in cands + reviews:
+        u = x.get("usage") or {}
+        if not u.get("total_tokens"):
+            f.append(f"no token usage reported for {x.get('model') or x.get('reviewer')}")
+            continue
+        per_call += u["total_tokens"]
+        if u.get("completion_tokens", 0) > cap:
+            f.append(f"{x.get('model') or x.get('reviewer')} produced {u['completion_tokens']} output tokens, above the {cap} cap")
+        if not u.get("cost_credits"):
+            f.append(f"no reported cost for {x.get('model') or x.get('reviewer')}")
+    tu = r.get("token_usage") or {}
+    chair_tokens = (tu.get("total_tokens") or 0) - per_call
+    chair_out = (tu.get("completion_tokens") or 0) - sum((x.get("usage") or {}).get("completion_tokens", 0) for x in cands + reviews)
+    if chair_tokens <= 0:
+        f.append("chairman usage missing from the request total")
+    if chair_out > cap:
+        f.append(f"chairman produced {chair_out} output tokens, above the {cap} cap")
+    cost = cold.get("reported_cost_credits")
+    if cost is None or not (0 < cost < 1):
+        f.append(f"request cost not reported or implausible: {cost}")
+    if cold.get("prometheus_llm_calls_delta") != 2 * len(m["members"]) + 1:
+        f.append(f"Prometheus model-call delta {cold.get('prometheus_llm_calls_delta')}, expected {2 * len(m['members']) + 1}")
+    if not c.get("stored_l1"):
+        f.append("cold answer was not stored in L1")
+    if warm is None:
+        f.append("no warm repeat was sent")
+        return f
+    wc = warm.get("classification") or {}
+    if (warm.get("status") != 200 or wc.get("tier") != "l1_exact" or wc.get("inference") or warm.get("model_calls")
+            or warm.get("prometheus_llm_calls_delta") != 0):
+        f.append(f"warm repeat was not a verified L1 hit with zero model calls: {wc}, delta {warm.get('prometheus_llm_calls_delta')}")
+    if (warm.get("response") or {}).get("answer") != r.get("answer"):
+        f.append("warm answer differs from the cold answer")
+    return f
 
 
 # ── estimates (dry run and budget) ───────────────────────────────────
@@ -300,6 +376,10 @@ def run(cfg: dict, out_root: Path, resume: Optional[Path] = None, authorize_paid
         return client.metrics_text(cfg["metrics_url"]) if cfg.get("metrics_url") else None
 
     resumed = bool(done)
+    preflight_key = _key("run", "preflight", 0)
+    need_preflight = cfg["mode"] == "real" and preflight_key not in done
+    if need_preflight and resumed:
+        raise PreflightError("resumed run has no passed preflight record; start a new run")
     client.register()  # a resumed run gets a new user (tokens are never written to disk)
     docmap: dict[str, str] = {}
     status = "completed"
@@ -353,6 +433,10 @@ def run(cfg: dict, out_root: Path, resume: Optional[Path] = None, authorize_paid
             eligible = (cold["status"] == 200 and cc["tier"] == "none" and cc["inference"] and cc["stored_l1"]
                         and not cc["degraded"] and council_ran(cold["response"] or {}))
             warm_pending = [i for i in range(cfg["warm_repeats"]) if _key(it.id, "warm", i) not in done]
+            if need_preflight and not eligible:
+                fails = preflight_failures(cold, None, cfg)
+                write({"key": _key("run", "preflight_failed", 0), "phase": "preflight_failed", "item_id": it.id, "failures": fails})
+                raise PreflightError(f"preflight failed: {fails}")
             if eligible and resumed and cold_key in done and warm_pending:
                 # The new user's cache is empty: a "warm" request would run a paid council.
                 write({"key": _key(it.id, "warm_skipped", 0), "item_id": it.id, "phase": "warm_skipped", "idx": 0,
@@ -363,6 +447,16 @@ def run(cfg: dict, out_root: Path, resume: Optional[Path] = None, authorize_paid
                     if _key(it.id, "warm", i) in done:
                         continue
                     w = send("warm", i, "council")
+                    if need_preflight:
+                        fails = preflight_failures(cold, w, cfg)
+                        if fails:
+                            write({"key": _key("run", "preflight_failed", 0), "phase": "preflight_failed", "item_id": it.id, "failures": fails})
+                            raise PreflightError(f"preflight failed: {fails}")
+                        write({"key": preflight_key, "phase": "preflight", "item_id": it.id, "status": "passed",
+                               "checks": ["full council (3 candidates, 3 reviews, chairman)", "pinned and served models",
+                                          "per-call usage and reported cost", f"output tokens <= {cfg['output_token_cap']}",
+                                          "parsed chairman JSON", "Prometheus delta 7 cold / 0 warm", "L1 hit with identical answer", "L2 disabled"]})
+                        need_preflight = False
                     wc = w["classification"]
                     bad = (w["status"] != 200 or wc["tier"] != "l1_exact" or wc["inference"] or w["model_calls"]
                            or (w["prometheus_llm_calls_delta"] or 0) > 0)
@@ -379,8 +473,8 @@ def run(cfg: dict, out_root: Path, resume: Optional[Path] = None, authorize_paid
                 send("deep", 0, "council_deep")
     except BudgetExceeded as exc:
         status = f"stopped: {exc}"
-    except IdentityError as exc:
-        status = f"stopped: {exc}"
+    except (IdentityError, PreflightError) as exc:
+        status = f"stopped: {redact(str(exc))}"
     except APIError as exc:
         status = f"stopped: {redact(str(exc))}"
     (run_dir / "run_state.json").write_text(json.dumps({"status": status, "budget": guard.state() if guard else None,

@@ -268,3 +268,63 @@ func TestUsageIsOmittedWhenNoProviderReportsIt(t *testing.T) {
 		t.Fatalf("usage invented: %+v", res.TokenUsage)
 	}
 }
+
+// Every paid model call must carry an output cap on the wire: stages with no
+// cap of their own get Council.MaxOutputTokens; reflection keeps its 500.
+func TestEveryStageSendsMaxTokensOnTheWire(t *testing.T) {
+	srv := newStageServer(t, false, script(replies{
+		"member":  "candidate",
+		"review":  "RANKING: A, B, C\nREASONING: fine.",
+		"chair":   `{"answer":"draft","reasoning":"r","source":"chairman-synthesis"}`,
+		"reflect": `{"quality":"needs_revision","issues":"thin","suggestion":"add","faithful":true}`,
+		"direct":  "direct answer",
+	}))
+	url := srv.URL + "/api/v1/chat/completions"
+	or := func(m string) llm.LLMClient { return llm.NewOpenRouterClient(fakeKey, url, m, 5*time.Second) }
+	c := New([]llm.LLMClient{or("m1"), or("m2"), or("m3")}, or("chair"), 5*time.Second)
+	c.MaxOutputTokens = 777
+
+	// The fake server labels revision as "chair" (same system prompt), so
+	// each strategy is checked right after it runs; in council_deep the last
+	// "chair" request is the revision.
+	checks := []struct {
+		strategy string
+		want     map[string]float64
+	}{
+		{"council", map[string]float64{"member": 777, "review": 777, "chair": 777}},
+		{"council_deep", map[string]float64{"reflect": 500, "chair": 777}},
+		{"direct", map[string]float64{"direct": 777}},
+	}
+	for _, tc := range checks {
+		if _, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: tc.strategy}, Evidence{}, nil); err != nil {
+			t.Fatalf("%s: %v", tc.strategy, err)
+		}
+		for stage, n := range tc.want {
+			body := srv.body(stage)
+			if body == nil {
+				t.Fatalf("%s: stage %s never called (seen %v)", tc.strategy, stage, srv.seen())
+			}
+			if body["max_tokens"] != n {
+				t.Errorf("%s: stage %s sent max_tokens=%v, want %v", tc.strategy, stage, body["max_tokens"], n)
+			}
+		}
+	}
+	chairs := 0
+	for _, st := range srv.seen() {
+		if st == "chair" {
+			chairs++
+		}
+	}
+	if chairs != 3 { // council chairman, deep chairman, deep revision
+		t.Fatalf("expected a revision call, chairman-prompt requests = %d", chairs)
+	}
+
+	// Zero means the package default, never "uncapped".
+	c.MaxOutputTokens = 0
+	if _, err := c.Run(context.Background(), QueryRequest{Question: "Q", Strategy: "direct"}, Evidence{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.body("direct")["max_tokens"]; got != float64(llm.DefaultMaxOutputTokens) {
+		t.Fatalf("default cap not applied: %v", got)
+	}
+}

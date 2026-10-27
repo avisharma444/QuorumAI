@@ -10,6 +10,11 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+// DefaultMaxOutputTokens is the output cap for council calls that set none
+// (LLM_MAX_OUTPUT_TOKENS overrides it). An uncapped call can bill thousands
+// of output tokens on a paid model.
+const DefaultMaxOutputTokens = 1024
+
 // GenerateOptions provides full control over one generation call.
 type GenerateOptions struct {
 	Messages     []Message // system + user + assistant turns

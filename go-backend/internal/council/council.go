@@ -163,6 +163,9 @@ type Council struct {
 	Members      []llm.LLMClient
 	Chairman     llm.LLMClient
 	StageTimeout time.Duration // per model call; 0 means 30s
+	// MaxOutputTokens caps calls whose stage sets no smaller cap;
+	// 0 means llm.DefaultMaxOutputTokens.
+	MaxOutputTokens int
 }
 
 // New builds a council.
@@ -338,6 +341,12 @@ func (c *Council) call(ctx context.Context, stage string, client llm.LLMClient, 
 	}
 	if tune != nil {
 		tune(&opts)
+	}
+	if opts.MaxTokens <= 0 {
+		opts.MaxTokens = c.MaxOutputTokens
+		if opts.MaxTokens <= 0 {
+			opts.MaxTokens = llm.DefaultMaxOutputTokens
+		}
 	}
 	resp, err := llm.Call(child, stage, client, opts)
 	if err == nil && resp == nil {

@@ -47,8 +47,10 @@ def pricing(tmp_path) -> Path:
 class FakeCouncilAPI:
     """In-memory stand-in with a real per-request L1 rule."""
 
-    def __init__(self, mode="mock", usage=True, warm_misses=False, degraded=False, swap_after=None, cost=0.001):
+    def __init__(self, mode="mock", usage=True, warm_misses=False, degraded=False, swap_after=None, cost=0.001,
+                 chair_unparsed=False, long_output=False):
         self.mode, self.usage, self.warm_misses, self.degraded = mode, usage, warm_misses, degraded
+        self.chair_unparsed, self.long_output = chair_unparsed, long_output
         self.swap_after, self.cost = swap_after, cost
         self.l1, self.calls, self.queries, self.health_checks = {}, 0, [], 0
 
@@ -86,12 +88,16 @@ class FakeCouncilAPI:
             resp = {"answer": "It was Ilse Varga, 42.", "strategy": "direct", "token_usage": u,
                     "cache": {"tier": "none", "inference_executed": True, "stored": ["l1_exact"], "l2": "disabled_by_policy"}}
             return QueryOutcome(200, resp, 300.0, "t", None, 0)
+        if u and self.long_output:
+            u = dict(u, completion_tokens=5000, total_tokens=5100)
         cands = [{"model": m, "served_model": m, "label": "ABC"[i], "answer": "Ilse Varga 42", "usage": u} for i, m in enumerate(MEMBERS)]
-        reviews = [{"reviewer": m, "usage": u} for m in MEMBERS]
+        reviews = [{"reviewer": m, "served_model": m, "usage": u} for m in MEMBERS]
         n = 7 + (2 if body["strategy"] == "council_deep" else 0)
         self.calls += n
+        total = {k: v * n for k, v in u.items()} if u else None  # request total = every call's usage
+        syn = {"status": "failed", "model": CHAIR, "error": "invalid JSON"} if self.chair_unparsed else {"status": "synthesized", "model": CHAIR}
         resp = {"answer": "Ilse Varga built it; 42.", "strategy": body["strategy"], "candidates": cands, "reviews": reviews,
-                "synthesis": {"status": "synthesized"}, "selected": "A", "token_usage": u,
+                "synthesis": syn, "selected": "A", "token_usage": total,
                 "degraded": ["chairman-failed-fallback"] if self.degraded else [],
                 "cache": {"tier": "none", "inference_executed": True, "stored": [] if self.degraded else ["l1_exact"], "l2": "disabled_by_policy"}}
         if body["strategy"] == "council_deep":
@@ -157,7 +163,7 @@ def test_offline_procedure_cold_warm_direct_deep(tmp_path):
             assert r["classification"]["tier"] == "l1_exact" and r["model_calls"] == 0 and r["prometheus_llm_calls_delta"] == 0
     s = CB.analyse(d)
     assert s["cache_workload"]["l1_hit_rate"] == pytest.approx(12 / 16) and s["avoided"]["model_calls"] == 12 * 7
-    assert s["avoided"]["prompt_tokens"] == 12 * 100 and s["speedup"]["median_paired_speedup"] == pytest.approx(2000.0)
+    assert s["avoided"]["prompt_tokens"] == 12 * 7 * 100 and s["speedup"]["median_paired_speedup"] == pytest.approx(2000.0)
     assert s["quality"]["outcomes"]["tie"] == 4
 
 
@@ -218,7 +224,7 @@ def test_verified_warm_hits_are_charged_nothing(tmp_path):
             prev = next(p for p in reversed(rs[:i]) if "budget" in p)
             assert r["budget"]["charged_usd"] == prev["budget"]["charged_usd"]
     cold = [r for r in rs if r["phase"] == "cold"]
-    assert all(r["reported_cost_credits"] == 0.001 for r in cold), "observed provider cost is recorded, not the estimate"
+    assert all(r["reported_cost_credits"] == pytest.approx(0.007) for r in cold), "observed provider cost is recorded, not the estimate"
 
 
 def test_missing_usage_is_charged_at_worst_case(tmp_path):
@@ -253,3 +259,49 @@ def test_dry_run_plans_without_any_http(tmp_path):
     assert plan["model_calls_expected"]["candidates"] == 3 * 4 + 3 * 2
     assert 0 < plan["likely_usd"] < plan["worst_case_usd"]
     assert plan["prices_missing_or_unverified"] == []
+
+
+# ── live preflight (first cold council + first warm repeat) ─────────
+
+def real_run(tmp_path, api):
+    return CB.run(config(tmp_path, mode="real"), tmp_path / "o", client=api, authorize_paid=True, max_requests=1000,
+                  max_spend_usd=100.0, pricing_path=pricing(tmp_path))
+
+
+def test_preflight_passes_once_then_the_run_continues(tmp_path):
+    d = real_run(tmp_path, FakeCouncilAPI(mode="live"))
+    rs = records(d)
+    pf = [r for r in rs if r["phase"].startswith("preflight")]
+    assert [r["phase"] for r in pf] == ["preflight"] and pf[0]["status"] == "passed"
+    i = rs.index(pf[0])
+    assert [r["phase"] for r in rs[:i]] == ["cold", "warm"], "preflight is decided after the first cold and first warm"
+    assert json.loads((d / "run_state.json").read_text())["status"] == "completed"
+
+
+@pytest.mark.parametrize("kw,needle", [
+    ({"chair_unparsed": True}, "chairman"),
+    ({"degraded": True}, "degraded"),
+    ({"usage": False}, "usage"),
+    ({"cost": 0}, "cost"),
+    ({"long_output": True}, "cap"),
+    ({"warm_misses": True}, "warm repeat"),
+])
+def test_preflight_failure_stops_the_whole_run(tmp_path, kw, needle):
+    api = FakeCouncilAPI(mode="live", **kw)
+    d = real_run(tmp_path, api)
+    rs = records(d)
+    fail = [r for r in rs if r["phase"] == "preflight_failed"]
+    assert len(fail) == 1 and any(needle in f for f in fail[0]["failures"]), fail
+    state = json.loads((d / "run_state.json").read_text())["status"]
+    assert state.startswith("stopped: preflight failed")
+    assert len({r["item_id"] for r in rs}) == 1, "no further question after a failed preflight"
+    assert not any(r["phase"] in ("direct", "deep") for r in rs)
+    assert len(api.queries) <= 2
+
+
+def test_resumed_real_run_without_passed_preflight_is_refused(tmp_path):
+    api = FakeCouncilAPI(mode="live", chair_unparsed=True)
+    d = real_run(tmp_path, api)
+    with pytest.raises(CB.PreflightError):
+        CB.run(config(tmp_path, mode="real"), tmp_path / "o", resume=d, client=FakeCouncilAPI(mode="live"), authorize_paid=True,
+               max_requests=1000, max_spend_usd=100.0, pricing_path=pricing(tmp_path))
