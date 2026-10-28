@@ -55,7 +55,7 @@ type Server struct {
 	// Breaker is the shared Redis breaker, reported by /health and Prometheus.
 	Breaker cache.CircuitBreaker
 	// SemanticReuse enables L2 answer reuse. Off by default in production:
-	// measured false-positive rates are too high (see README).
+	// measured false-positive rates are too high (see docs/architecture.md).
 	SemanticReuse bool
 
 	// Authentication and authorization.

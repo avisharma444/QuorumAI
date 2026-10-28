@@ -10,7 +10,7 @@
 server:
   port: "8080"
   # L2 semantic cache: minimum cosine similarity (1 - distance) for a hit.
-  # Reference default. See README "Semantic cache threshold" for measured
+  # Reference default. See docs/architecture.md (Caching) for measured
   # false-positive rates before changing it.
   semantic_cache_threshold: 0.85
   # JWT_SECRET is required and comes only from the environment (never this file).
